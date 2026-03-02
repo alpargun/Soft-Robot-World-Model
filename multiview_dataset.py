@@ -23,12 +23,29 @@ class MultiViewSoftRobotDataset(Dataset):
         transform_list.append(T.Resize(size=image_size, antialias=True))
         self.spatial_transform = T.Compose(transform_list)
         
-        self.case_folders = sorted([
+        # Filter folders to only include those with all 4 videos and a CSV file
+        raw_folders = [
             os.path.join(data_dir, d) for d in os.listdir(data_dir) 
             if os.path.isdir(os.path.join(data_dir, d)) and d.startswith("Case_")
-        ])
-        
-        print(f"Found {len(self.case_folders)} cases. Loading {len(self.views_to_load)} views per case.")
+        ]
+
+        self.case_folders = []
+        for folder in raw_folders:
+            # Check if all 4 videos exist
+            has_all_videos = True
+            for view in self.views_to_load:
+                if not glob.glob(os.path.join(folder, f"*_View{view}.avi")):
+                    has_all_videos = False
+                    break
+                    
+            # Check if CSV exists
+            has_csv = len(glob.glob(os.path.join(folder, "*_Data.csv"))) > 0
+            
+            if has_all_videos and has_csv:
+                self.case_folders.append(folder)
+                
+        self.case_folders = sorted(self.case_folders)
+        print(f"Found {len(self.case_folders)} fully complete cases. Skipped {len(raw_folders) - len(self.case_folders)} incomplete/failed cases.")
 
     def __len__(self):
         return len(self.case_folders)
@@ -149,16 +166,15 @@ if __name__ == "__main__":
     # Point this to your new fast-export run folder
     DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_15-07-54"
     
-    dataset = MultiViewSoftRobotDataset(DATA_DIR, image_size=(128, 128), crop_size=800)
+    dataset = MultiViewSoftRobotDataset(DATA_DIR, image_size=(128, 128), crop_size=600)
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
     
     for batch in dataloader:
         videos = batch["video"]
         actions = batch["pressures"]
         
-        print(f"Batch Video Shape: {videos.shape}") 
-        print(f"Batch Actions Shape: {actions.shape}") 
-        # Actions should now print exactly [Batch_Size, 60, 3]!
+        print(f"Batch Video Shape: {videos.shape}") # Should print [Batch_Size, Time=60, Views=4, C=3, H=128, W=128]
+        print(f"Batch Actions Shape: {actions.shape}") # Should print [Batch_Size, Time=60, 3]
         break
 
     # Visualize the first case
