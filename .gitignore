@@ -10,6 +10,8 @@
 runs/
 
 training_renders/
+*.mp4
+TODO.md
 
 
 # GENERAL PYTHON GITIGNORE TEMPLATE
