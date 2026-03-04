@@ -7,6 +7,7 @@ import torch
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.subplots
 import matplotlib.pyplot as plt
 from matplotlib import animation
 
@@ -24,6 +25,9 @@ class SoftRobotDataset(Dataset):
         self.crop_size = crop_size
         self.image_mode = image_mode.lower()
         
+        # --- INJECTED FIX: Dictionary to hold processed data in RAM ---
+        self.cache = {}
+        
         folders = glob.glob(os.path.join(run_folder, "Case_*"))
         self.case_folders = sorted(folders, key=lambda x: int(re.search(r'Case_(\d+)', os.path.basename(x)).group(1)))
         
@@ -34,6 +38,10 @@ class SoftRobotDataset(Dataset):
         return len(self.case_folders)
 
     def __getitem__(self, idx):
+        # --- INJECTED FIX: Skip OpenCV processing if we already did it ---
+        if idx in self.cache:
+            return self.cache[idx]
+            
         case_folder = self.case_folders[idx]
         
         # 1. LOAD THE PRESSURE PROFILE
@@ -125,7 +133,11 @@ class SoftRobotDataset(Dataset):
         # Normalize to [0, 1] for stable neural network inputs (Assuming 100 kPa is max)
         pressures_tensor = torch.tensor(aligned_pressures / 100.0) 
 
-        return {"video": videos, "pressures": pressures_tensor}
+        # --- INJECTED FIX: Save to RAM before returning ---
+        result = {"video": videos, "pressures": pressures_tensor}
+        self.cache[idx] = result
+        
+        return result
 
 # ==========================================
 # --- HYSTERESIS PLOTTING TOOL ---
