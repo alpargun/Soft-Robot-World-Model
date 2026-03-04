@@ -12,7 +12,6 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Import custom modules
 from multiview_dataset import SoftRobotDataset
-from other.triplane_encoder import TriPlaneEncoder
 from encoder import ResNetTriPlaneEncoder
 from temporal_dynamics import TriPlaneDynamics
 from decoder import TriPlaneDecoder

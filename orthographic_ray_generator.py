@@ -38,14 +38,14 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
             v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
             
         else:
-            # RANDOM SAMPLING: Your original scattered sampling for L1 masks
+            # RANDOM SAMPLING: Scattered sampling for L1 masks
             u = (torch.rand(B, samples_per_view, device=device) * 2) - 1 # Width axis
             v_coord = (torch.rand(B, samples_per_view, device=device) * 2) - 1 # Height axis
             
             u_idx = torch.clamp(((u + 1) * 0.5 * W).long(), 0, W - 1)
             v_idx = torch.clamp(((v_coord + 1) * 0.5 * H).long(), 0, H - 1) 
         
-        # 2. Map coordinates based on your strict ANSYS camera positions
+        # 2. Map coordinates based on strict ANSYS camera positions
         if v == 0: # Side 1 (Camera at +X, looking at -X)
             orig[..., 0] = 1.0
             orig[..., 1] = u
@@ -73,8 +73,12 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
         # 3. Extract the RGB values: [B, samples_per_view, 3]
         batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(B, samples_per_view)
         
-        # PyTorch images are [Channels, Height, Width], so we index [..., C, v_idx, u_idx]
-        rgb = target_frames[batch_indices, v, :, v_idx, u_idx] 
+        # FIX: Isolate the view, permute Channels to the end, then index safely.
+        view_frames = target_frames[:, v]                 # Shape: [B, C, H, W]
+        view_frames = view_frames.permute(0, 2, 3, 1)     # Shape: [B, H, W, C]
+        
+        # Now indexing pulls directly into [B, samples_per_view, C]
+        rgb = view_frames[batch_indices, v_idx, u_idx, :] 
         target_rgb_list.append(rgb)
 
     # Combine all views into a single batch of rays
