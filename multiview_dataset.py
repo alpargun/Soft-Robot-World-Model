@@ -1,134 +1,178 @@
 import os
 import glob
+import re
+
 import cv2
 import torch
 import pandas as pd
 import numpy as np
-import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+from matplotlib import animation
 
-class MultiViewSoftRobotDataset(Dataset):
-    def __init__(self, data_dir, image_size=(128, 128), crop_size=800):
+class SoftRobotDataset(Dataset):
+    def __init__(self, run_folder, img_size=(128, 128), crop_size=600, image_mode="mask"):
         """
-        Loads 4 synced views and a sequential pressure tensor [Time, 3]
+        Args:
+            run_folder (str): Path to the main 'Run_YYYY-MM-DD_...' directory.
+            img_size (tuple): Target (Height, Width) for the neural network.
+            crop_size (int): Center crop square dimension BEFORE resizing.
+            image_mode (str): "mask" (silhouette), "rgb" (color), or "grayscale".
         """
-        self.data_dir = data_dir
-        self.views_to_load = ["Side1", "Side2", "Side3", "Top"]
+        self.run_folder = run_folder
+        self.img_size = img_size
+        self.crop_size = crop_size
+        self.image_mode = image_mode.lower()
         
-        transform_list = []
-        if crop_size:
-            transform_list.append(T.CenterCrop(crop_size))
-        transform_list.append(T.Resize(size=image_size, antialias=True))
-        self.spatial_transform = T.Compose(transform_list)
+        folders = glob.glob(os.path.join(run_folder, "Case_*"))
+        self.case_folders = sorted(folders, key=lambda x: int(re.search(r'Case_(\d+)', os.path.basename(x)).group(1)))
         
-        # Filter folders to only include those with all 4 videos and a CSV file
-        raw_folders = [
-            os.path.join(data_dir, d) for d in os.listdir(data_dir) 
-            if os.path.isdir(os.path.join(data_dir, d)) and d.startswith("Case_")
-        ]
-
-        self.case_folders = []
-        for folder in raw_folders:
-            # Check if all 4 videos exist
-            has_all_videos = True
-            for view in self.views_to_load:
-                if not glob.glob(os.path.join(folder, f"*_View{view}.avi")):
-                    has_all_videos = False
-                    break
-                    
-            # Check if CSV exists
-            has_csv = len(glob.glob(os.path.join(folder, "*_Data.csv"))) > 0
+        if len(self.case_folders) == 0:
+            print(f"Warning: No Case folders found in {run_folder}")
             
-            if has_all_videos and has_csv:
-                self.case_folders.append(folder)
-                
-        self.case_folders = sorted(self.case_folders)
-        print(f"Found {len(self.case_folders)} fully complete cases. Skipped {len(raw_folders) - len(self.case_folders)} incomplete/failed cases.")
-
     def __len__(self):
         return len(self.case_folders)
 
-    def _read_video(self, video_path):
-        cap = cv2.VideoCapture(video_path)
-        frames = []
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
-        cap.release()
-        
-        video_np = np.array(frames, dtype=np.float32) / 255.0 
-        video_tensor = torch.from_numpy(video_np).permute(0, 3, 1, 2)
-        video_tensor = self.spatial_transform(video_tensor)
-        return video_tensor
-
     def __getitem__(self, idx):
-        folder_path = self.case_folders[idx]
+        case_folder = self.case_folders[idx]
         
-        # 1. Load Multi-View Videos
-        view_tensors = []
-        for view in self.views_to_load:
-            video_pattern = os.path.join(folder_path, f"*_View{view}.avi")
-            video_file = glob.glob(video_pattern)[0]
-            v_tensor = self._read_video(video_file) 
-            view_tensors.append(v_tensor)
+        # 1. LOAD THE PRESSURE PROFILE
+        csv_path = glob.glob(os.path.join(case_folder, "*_PressureProfile.csv"))[0]
+        df = pd.read_csv(csv_path)
+        pressures_kpa = df.iloc[:, 1:4].values.astype(np.float32) 
+        
+        # 2. LOAD THE VIDEOS
+        views = ["ViewSide1", "ViewSide2", "ViewSide3", "ViewTop"]
+        all_views_frames = []
+        num_frames_in_video = 0
+        
+        for view_name in views:
+            video_path = glob.glob(os.path.join(case_folder, f"*{view_name}.avi"))[0]
+            cap = cv2.VideoCapture(video_path)
             
-        # Shape: [Time=60, Views=4, Channels=3, H=128, W=128]
-        multi_view_video = torch.stack(view_tensors, dim=1)
-            
-        # 2. Parse the CSV for Sequential Pressures
-        csv_pattern = os.path.join(folder_path, "*_Data.csv")
-        csv_file = glob.glob(csv_pattern)[0]
-        
-        # Read only the necessary columns to save RAM
-        df = pd.read_csv(csv_file, usecols=['Time(s)', ' Inst_P1(Pa)', ' Inst_P2(Pa)', ' Inst_P3(Pa)'])
-        
-        # Drop duplicates to isolate the 60 unique time steps, and ensure they are in order
-        df_unique = df.drop_duplicates(subset=['Time(s)']).sort_values(by='Time(s)')
-        
-        # Extract columns as numpy arrays
-        p1_seq = df_unique[' Inst_P1(Pa)'].values
-        p2_seq = df_unique[' Inst_P2(Pa)'].values
-        p3_seq = df_unique[' Inst_P3(Pa)'].values
-        
-        # Stack into [60, 3] and normalize to [0, 1] based on 100k Max Pressure
-        pressures_seq = np.stack([p1_seq, p2_seq, p3_seq], axis=1)
-        pressures_tensor = torch.tensor(pressures_seq, dtype=torch.float32) / 100000.0
-        
-        return {
-            "video": multi_view_video,           # Shape: [60, 4, 3, H, W]
-            "pressures": pressures_tensor        # Shape: [60, 3]
-        }
+            frames = []
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                    
+                # CROP LOGIC
+                if self.crop_size is not None:
+                    h, w = frame.shape[:2]
+                    cx, cy = w // 2, h // 2
+                    half = self.crop_size // 2
+                    frame = frame[max(0, cy-half):min(h, cy+half), max(0, cx-half):min(w, cx+half)]
+                
+                # --- MULTI-MODE PROCESSING ---
+                if self.image_mode == "rgb":
+                    frame_c = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_resized = cv2.resize(frame_c, self.img_size, interpolation=cv2.INTER_AREA)
+                    frame_tensor = frame_resized.astype(np.float32) / 255.0
+                    
+                elif self.image_mode == "grayscale":
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    frame_resized = cv2.resize(gray, self.img_size, interpolation=cv2.INTER_AREA)
+                    # Merge to 3 channels to keep ResNet architecture consistent
+                    frame_c = cv2.merge([frame_resized, frame_resized, frame_resized])
+                    frame_tensor = frame_c.astype(np.float32) / 255.0
 
+                elif self.image_mode == "mask":
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                    edges = cv2.Canny(blurred, 20, 100)
+
+                    kernel = np.ones((5, 5), np.uint8)
+                    dilated = cv2.dilate(edges, kernel, iterations=2)
+                    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    mask = np.zeros_like(gray)
+                    if contours:
+                        largest_contour = max(contours, key=cv2.contourArea)
+                        cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+
+                    mask = cv2.erode(mask, kernel, iterations=2)
+                    
+                    # Ultimate cleanup pass
+                    final_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    clean_mask = np.zeros_like(mask)
+                    if final_contours:
+                        true_largest = max(final_contours, key=cv2.contourArea)
+                        cv2.drawContours(clean_mask, [true_largest], -1, 255, thickness=cv2.FILLED)
+                    
+                    # KEY FIX: INTER_NEAREST prevents halo artifacts during downscaling
+                    mask_resized = cv2.resize(clean_mask, self.img_size, interpolation=cv2.INTER_NEAREST)
+                    mask_3c = cv2.merge([mask_resized, mask_resized, mask_resized])
+                    frame_tensor = mask_3c.astype(np.float32) / 255.0 
+                
+                # Channel-first format: [C, H, W]
+                frame_tensor = np.transpose(frame_tensor, (2, 0, 1))
+                frames.append(frame_tensor)
+                
+            cap.release()
+            video_tensor = torch.tensor(np.array(frames)) # [Time, 3, 128, 128]
+            all_views_frames.append(video_tensor)
+            num_frames_in_video = len(frames)
+            
+        videos = torch.stack(all_views_frames, dim=1) # [Time, Views, C, H, W]
+        
+        # 3. ALIGN TIME & NORMALIZE
+        aligned_pressures = pressures_kpa[-num_frames_in_video:]
+        pressures_tensor = torch.tensor(aligned_pressures / 100.0) 
+
+        return {"video": videos, "pressures": pressures_tensor}
+
+# ==========================================
+# --- HYSTERESIS PLOTTING TOOL ---
+# ==========================================
+def plot_hysteresis_curve(dataset, sample_index=0):
+    print(f"Loading node data for sample {sample_index} to calculate hysteresis...")
+    case_folder = dataset.case_folders[sample_index]
+    
+    node_csv_path = glob.glob(os.path.join(case_folder, "*_NodeData.csv"))[0]
+    press_csv_path = glob.glob(os.path.join(case_folder, "*_PressureProfile.csv"))[0]
+    
+    df_nodes = pd.read_csv(node_csv_path)
+    df_press = pd.read_csv(press_csv_path)
+    
+    df_nodes.columns = df_nodes.columns.str.strip()
+    df_press.columns = df_press.columns.str.strip()
+    
+    df_nodes['TotalDef_mm'] = np.sqrt(df_nodes['DefX(m)']**2 + df_nodes['DefY(m)']**2 + df_nodes['DefZ(m)']**2) * 1000.0
+    max_def_per_time = df_nodes.groupby('Time(s)')['TotalDef_mm'].max().reset_index()
+    
+    df_press['Time(s)'] = df_press['Time(s)'].round(4)
+    max_def_per_time['Time(s)'] = max_def_per_time['Time(s)'].round(4)
+    
+    merged_df = pd.merge(max_def_per_time, df_press, on='Time(s)', how='inner')
+    merged_df['Active_Pressure_kPa'] = merged_df[['P1(kPa)', 'P2(kPa)', 'P3(kPa)']].max(axis=1)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(merged_df['Active_Pressure_kPa'], merged_df['TotalDef_mm'], marker='o', linestyle='-', color='b', markersize=4)
+    
+    plt.title(f"Hysteresis Curve (Case {sample_index+1})", fontsize=16)
+    plt.xlabel("Applied Pressure (kPa)", fontsize=14)
+    plt.ylabel("Max Total Deformation (mm)", fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
 
 # ==========================================
 # --- DEBUG: DYNAMIC MULTI-VIEW VISUALIZER ---
 # ==========================================
 def visualize_dynamic_multiview(dataset, sample_index=0):
-    """
-    Plays all 4 views side-by-side and dynamically updates the instantaneous 
-    pressure text for every frame.
-    """
     print(f"Loading sample {sample_index} for visualization...")
     sample = dataset[sample_index]
     
-    video_tensor = sample["video"]             # Shape: [Time=60, Views=4, C=3, H, W]
-    pressures_tensor = sample["pressures"]     # Shape: [Time=60, 3]
+    video_tensor = sample["video"]             
+    pressures_tensor = sample["pressures"]     
     
-    # Un-normalize data back to raw formats for viewing
-    video_np = video_tensor.permute(0, 1, 3, 4, 2).numpy() # [60, 4, H, W, 3]
-    pressures_np = (pressures_tensor * 100000.0).int().numpy()   # [60, 3] in Pascals
+    video_np = video_tensor.permute(0, 1, 3, 4, 2).numpy() 
+    pressures_np = (pressures_tensor * 100000.0).int().numpy()   
     
-    # Setup Figure
     fig, axes = plt.subplots(2, 2, figsize=(8, 8))
     axes = axes.flatten()
     view_names = ["Side 1 (+X)", "Side 2 (+Y)", "Side 3 (-X)", "Top (+Z)"]
     
-    # Initialize the plot with Frame 0
     p_init = pressures_np[0]
     title = fig.suptitle(f"Time: 0.00s | P1: {p_init[0]} | P2: {p_init[1]} | P3: {p_init[2]} Pa", fontsize=14)
     
@@ -139,43 +183,23 @@ def visualize_dynamic_multiview(dataset, sample_index=0):
         im = ax.imshow(video_np[0, i])
         ims.append(im)
     
-    # Animation Update Function
     def update(frame_idx):
-        # Update the 4 images
         for i, im in enumerate(ims):
             im.set_array(video_np[frame_idx, i])
             
-        # Update the title with the instantaneous pressure for this exact frame
         p_curr = pressures_np[frame_idx]
         current_time = (frame_idx + 1) * (2.0 / 60)
         title.set_text(f"Time: {current_time:.2f}s | P1: {p_curr[0]} | P2: {p_curr[1]} | P3: {p_curr[2]} Pa")
-        
         return ims + [title]
     
-    # Play Animation (~33ms interval = 30 FPS)
     anim = animation.FuncAnimation(fig, update, frames=len(video_np), interval=33, repeat=True)
-    
     plt.tight_layout()
     plt.show()
 
-
-# ==========================================
-# --- DEBUG ---
-# ==========================================
 if __name__ == "__main__":
-    # Point this to your new fast-export run folder
-    DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_15-07-54"
+    DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
     
-    dataset = MultiViewSoftRobotDataset(DATA_DIR, image_size=(128, 128), crop_size=600)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    # Toggle "mask", "rgb", or "grayscale" directly here!
+    dataset = SoftRobotDataset(run_folder=DATA_DIR, img_size=(128, 128), crop_size=600, image_mode="mask")
     
-    for batch in dataloader:
-        videos = batch["video"]
-        actions = batch["pressures"]
-        
-        print(f"Batch Video Shape: {videos.shape}") # Should print [Batch_Size, Time=60, Views=4, C=3, H=128, W=128]
-        print(f"Batch Actions Shape: {actions.shape}") # Should print [Batch_Size, Time=60, 3]
-        break
-
-    # Visualize the first case
     visualize_dynamic_multiview(dataset, sample_index=0)

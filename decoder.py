@@ -1,0 +1,72 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TriPlaneDecoder(nn.Module):
+    def __init__(self, feature_dim=32, hidden_dim=64):
+        super().__init__()
+        
+        # A lightweight Multi-Layer Perceptron (MLP)
+        # It takes the summed features from the 3 planes and predicts Color and Density
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.rgb_head = nn.Sequential(
+            nn.Linear(hidden_dim, 3),
+            nn.Sigmoid() # Colors are between 0 and 1
+        )
+        
+        self.density_head = nn.Sequential(
+            nn.Linear(hidden_dim, 1),
+            nn.Softplus() # Density must be positive
+        )
+
+    def sample_plane(self, plane_features, coordinates):
+        """
+        Extracts features from a 2D plane at the specified coordinates.
+        coordinates: [Batch, N_points, 2] (Normalized between -1 and 1)
+        """
+        # grid_sample expects coordinates in shape [Batch, H, W, 2]
+        # We dummy-expand our N_points into a 1D spatial grid
+        B, N, _ = coordinates.shape
+        grid = coordinates.view(B, 1, N, 2) 
+        
+        # Extract features using bilinear interpolation
+        sampled_features = F.grid_sample(plane_features, grid, align_corners=True, padding_mode='zeros')
+        
+        # Reshape back to [Batch, N_points, feature_dim]
+        return sampled_features.squeeze(2).permute(0, 2, 1)
+
+    def forward(self, tri_planes, points_3d):
+        """
+        Inputs:
+            tri_planes: Dict of 'xy', 'xz', 'yz' feature tensors [B, feature_dim, H, W]
+            points_3d: 3D coordinates to query [B, N_points, 3] (normalized -1 to 1)
+        Outputs:
+            rgb: Predicted colors [B, N_points, 3]
+            density: Predicted solidness [B, N_points, 1]
+        """
+        # 1. Project the 3D points onto the 3 orthogonal 2D planes
+        # points_3d is (X, Y, Z)
+        coords_xy = points_3d[..., [0, 1]] 
+        coords_xz = points_3d[..., [0, 2]]
+        coords_yz = points_3d[..., [1, 2]]
+        
+        # 2. Extract the features from each plane
+        feat_xy = self.sample_plane(tri_planes['xy'], coords_xy)
+        feat_xz = self.sample_plane(tri_planes['xz'], coords_xz)
+        feat_yz = self.sample_plane(tri_planes['yz'], coords_yz)
+        
+        # 3. Aggregate features (Summing is standard for Tri-planes)
+        fused_features = feat_xy + feat_xz + feat_yz
+        
+        # 4. Predict RGB and Density using the MLP
+        hidden = self.mlp(fused_features)
+        rgb = self.rgb_head(hidden)
+        density = self.density_head(hidden)
+        
+        return rgb, density

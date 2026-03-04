@@ -38,7 +38,7 @@ class ResNetTriPlaneEncoder(nn.Module):
         # Flatten the batch and views dimensions to process all images simultaneously
         # This prevents running the heavy ResNet 4 separate times in a loop!
         # Shape becomes: [Batch * 4, 3, 128, 128]
-        flat_frames = multi_view_frames.view(B * Views, C, H, W)
+        flat_frames = multi_view_frames.reshape(B * Views, C, H, W)
         
         # Extract features -> Shape: [Batch * 4, 64, 32, 32]
         resnet_features = self.backbone(flat_frames)
@@ -48,7 +48,7 @@ class ResNetTriPlaneEncoder(nn.Module):
         
         # Unflatten back to separated views -> Shape: [Batch, 4, feature_dim, 32, 32]
         _, F_dim, F_H, F_W = compressed_features.shape
-        features = compressed_features.view(B, Views, F_dim, F_H, F_W)
+        features = compressed_features.reshape(B, Views, F_dim, F_H, F_W)
         
         # Split into the specific camera views
         f_side1 = features[:, 0] # Looks at YZ
