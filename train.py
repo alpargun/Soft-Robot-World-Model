@@ -20,17 +20,16 @@ from volumetric_ray_marcher import VolumetricRayMarcher
 from orthographic_ray_generator import sample_orthographic_rays
 from visualization_helper import get_full_image_rays
 
-
 def main():
     # 1. Configuration
     DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    IMAGE_MODE = "rgb" # Change to "rgb" to automatically enable LPIPS perceptual loss!
+    IMAGE_MODE = "mask" # Change to "rgb" to automatically enable LPIPS perceptual loss!
     
     BATCH_SIZE = 2 # or 4 if GPU memory allows
     FEATURE_DIM = 32
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 500
-    RAYS_PER_STEP = 1600 # Number of rays to sample per time step for loss calculation (VRAM optimization). Increase for better quality
+    RAYS_PER_STEP = 1600 # Number of rays to sample per time step for loss calculation
     
     # Check for GPU availability
     if torch.cuda.is_available():
@@ -52,13 +51,14 @@ def main():
 
     # 2. Initialize Dataset
     dataset = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     
     # ===========================================================================================================
-    # OVERFIT TEST: Uncomment the following lines to quickly test the training loop on a single batch
-    overfit_dataset = Subset(dataset, indices=[-1, -2]) # Grab only the last 2 cases
-    # Pass the overfit_dataset to the dataloader instead of the full_dataset
-    dataloader = DataLoader(overfit_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    # FULL DATASET ENABLED: We use the full dataset to properly learn the hysteresis curve across all cases
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    
+    # OVERFIT TEST: Commented out for production run.
+    # overfit_dataset = Subset(dataset, indices=[-1, -2]) 
+    # dataloader = DataLoader(overfit_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     # ===========================================================================================================
 
     # 3. Initialize Model Components
@@ -69,13 +69,16 @@ def main():
 
     # 4. Optimizer Setup
     all_params = list(encoder.parameters()) + list(dynamics.parameters()) + list(decoder.parameters())
-    optimizer = optim.Adam(all_params, lr=LEARNING_RATE)
     
-    # L1 loss is often better for image data as it encourages sharper predictions compared to MSE which can be blurrier
+    # Added weight decay to prevent FiLM Shift (beta) parameters from growing too large and ignoring inputs
+    optimizer = optim.Adam(all_params, lr=LEARNING_RATE, weight_decay=1e-5)
+    
+    # StepLR cuts the learning rate in half every 100 epochs to refine delicate physical bends
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+    
     l1_loss_fn = nn.L1Loss() 
     
     if IMAGE_MODE == "rgb":
-        # LPIPS is a perceptual loss function that is more robust than MSE. or "alex"
         lpips_loss_fn = lpips.LPIPS(net='vgg').to(device) 
 
     # 5. The Training Loop
@@ -86,13 +89,12 @@ def main():
         
         epoch_loss = 0.0
         
-        # Calculate Teacher Forcing Ratio: 
-        # Starts at 1.0 (100% help) and decays to 0.0 (0% help) by epoch 250
+        # Calculate Teacher Forcing Ratio
         tf_ratio = max(0.0, 1.0 - (epoch / (NUM_EPOCHS * 0.5)))
         
         for batch_idx, batch in enumerate(dataloader):
             videos = batch["video"].to(device)       
-            pressures = batch["pressures"].to(device) 
+            pressures = batch["pressures"].to(device) # Pressures are pre-normalized by Dataset!
             
             B, Time, Views, C, H, W = videos.shape 
             
@@ -165,20 +167,25 @@ def main():
                             
                             comparison_grid = torch.cat((real_frame, pred_frame), dim=2)
                             writer.add_image(f'Comparison_View/Side_{v+1}', comparison_grid, epoch + 1)
-                # ---------------------------------------------------------
 
             batch_sequence_loss = batch_sequence_loss / (Time - 1)
             batch_sequence_loss.backward()
             
+            # CRITICAL: Gradient clipping prevents FiLM from blowing up during pure autoregression
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
             
             epoch_loss += batch_sequence_loss.item()
             
+        # Step the learning rate down appropriately per epoch
+        scheduler.step()
+            
         avg_loss = epoch_loss / len(dataloader)
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | TF Ratio: {tf_ratio:.2f} | Avg Seq Loss: {avg_loss:.6f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/TF_Ratio', tf_ratio, epoch + 1)
+        # Optional: track LR visually
+        writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
         if (epoch + 1) % 50 == 0:
             torch.save({

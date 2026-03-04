@@ -51,7 +51,7 @@ class SoftRobotDataset(Dataset):
             cap = cv2.VideoCapture(video_path)
             
             frames = []
-            while True:
+            while True: # Reads video exactly as rendered, preserving the temporal ramp-up/ramp-down sequence!
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -92,7 +92,7 @@ class SoftRobotDataset(Dataset):
 
                     mask = cv2.erode(mask, kernel, iterations=2)
                     
-                    # Ultimate cleanup pass
+                    # Ultimate cleanup pass to ensure a single solid silhouette with no holes or noise
                     final_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     clean_mask = np.zeros_like(mask)
                     if final_contours:
@@ -115,8 +115,14 @@ class SoftRobotDataset(Dataset):
             
         videos = torch.stack(all_views_frames, dim=1) # [Time, Views, C, H, W]
         
-        # 3. ALIGN TIME & NORMALIZE
+        # 3. ALIGN TIME & STRICT NORMALIZATION
         aligned_pressures = pressures_kpa[-num_frames_in_video:]
+        
+        # Establishing a hard physical boundary to prevent mathematical collapse or negative vacuums
+        MIN_PRESSURE = 1.0 
+        aligned_pressures = np.clip(aligned_pressures, a_min=MIN_PRESSURE, a_max=None)
+        
+        # Normalize to [0, 1] for stable neural network inputs (Assuming 100 kPa is max)
         pressures_tensor = torch.tensor(aligned_pressures / 100.0) 
 
         return {"video": videos, "pressures": pressures_tensor}
@@ -202,4 +208,6 @@ if __name__ == "__main__":
     # Toggle "mask", "rgb", or "grayscale" directly here!
     dataset = SoftRobotDataset(run_folder=DATA_DIR, img_size=(128, 128), crop_size=600, image_mode="mask")
     
+    # Run the debug visualizer and explicitly call the hysteresis plot function
+    plot_hysteresis_curve(dataset, sample_index=0)
     visualize_dynamic_multiview(dataset, sample_index=0)
