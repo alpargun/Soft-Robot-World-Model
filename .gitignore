@@ -1,3 +1,18 @@
+# Project related .gitignore file.
+# torch, torchvision, and torchaudio specific files
+*.pth
+*.pt
+*.ckpt
+*.pth.tar
+*.pt.tar
+*.ckpt.tar
+# TensorBoard logs
+runs/
+
+training_renders/
+
+
+# GENERAL PYTHON GITIGNORE TEMPLATE
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
