@@ -7,7 +7,6 @@ import torch
 import pandas as pd
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-import matplotlib.subplots
 import matplotlib.pyplot as plt
 from matplotlib import animation
 
