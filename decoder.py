@@ -3,11 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TriPlaneDecoder(nn.Module):
-    def __init__(self, feature_dim=32, hidden_dim=64):
+    def __init__(self, feature_dim=32, hidden_dim=64, image_mode="mask"):
         super().__init__()
         
-        # A lightweight Multi-Layer Perceptron (MLP)
-        # It takes the summed features from the 3 planes and predicts Color and Density
+        self.image_mode = image_mode
+        # Toggle output channels based on the mode
+        out_channels = 1 if image_mode == "mask" else 3
+        
         self.mlp = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -15,14 +17,15 @@ class TriPlaneDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        self.rgb_head = nn.Sequential(
-            nn.Linear(hidden_dim, 3),
-            nn.Sigmoid() # Colors are between 0 and 1
+        # Renamed to color_head since it might just output 1 channel
+        self.color_head = nn.Sequential(
+            nn.Linear(hidden_dim, out_channels),
+            nn.Sigmoid() 
         )
         
         self.density_head = nn.Sequential(
             nn.Linear(hidden_dim, 1),
-            nn.Softplus() # Density must be positive
+            nn.Softplus() 
         )
 
     def sample_plane(self, plane_features, coordinates):
@@ -64,9 +67,11 @@ class TriPlaneDecoder(nn.Module):
         # 3. Aggregate features (Summing is standard for Tri-planes)
         fused_features = feat_xy + feat_xz + feat_yz
         
-        # 4. Predict RGB and Density using the MLP
+        # 4. Predict Color and Density using the MLP
         hidden = self.mlp(fused_features)
-        rgb = self.rgb_head(hidden)
-        density = self.density_head(hidden)
         
-        return rgb, density
+        # Outputs either [B, N, 1] or [B, N, 3]
+        color_out = self.color_head(hidden)
+        density = self.density_head(hidden)
+
+        return color_out, density

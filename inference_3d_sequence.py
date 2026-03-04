@@ -46,7 +46,7 @@ def main():
     # ==========================================
     encoder = ResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
-    decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM).to(device)
+    decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     
     if os.path.exists(CHECKPOINT_PATH):
         print(f"Loading checkpoint: {CHECKPOINT_PATH}")

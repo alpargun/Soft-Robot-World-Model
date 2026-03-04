@@ -38,12 +38,37 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
             v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
             
         else:
-            # RANDOM SAMPLING: Scattered sampling for L1 masks
-            u = (torch.rand(B, samples_per_view, device=device) * 2) - 1 # Width axis
-            v_coord = (torch.rand(B, samples_per_view, device=device) * 2) - 1 # Height axis
+            # === THE FIX: FOREGROUND-BIASED SAMPLING ===
+            num_fg = samples_per_view // 2  # 50% of rays MUST hit the robot
+            num_bg = samples_per_view - num_fg
             
-            u_idx = torch.clamp(((u + 1) * 0.5 * W).long(), 0, W - 1)
-            v_idx = torch.clamp(((v_coord + 1) * 0.5 * H).long(), 0, H - 1) 
+            u_idx = torch.zeros(B, samples_per_view, device=device, dtype=torch.long)
+            v_idx = torch.zeros(B, samples_per_view, device=device, dtype=torch.long)
+            
+            # Get the view mask (just channel 0 to find the robot shape)
+            view_mask = target_frames[:, v, 0, :, :] 
+            
+            for b in range(B):
+                # Find coordinates where the mask is white (> 0.5)
+                fg_coords = torch.nonzero(view_mask[b] > 0.5) 
+                
+                if len(fg_coords) > 0:
+                    # Randomly pick from the foreground (the robot)
+                    rand_fg_indices = torch.randint(0, len(fg_coords), (num_fg,))
+                    chosen_fg = fg_coords[rand_fg_indices]
+                    v_idx[b, :num_fg] = chosen_fg[:, 0]
+                    u_idx[b, :num_fg] = chosen_fg[:, 1]
+                else:
+                    # Fallback if the frame is completely empty (rare)
+                    v_idx[b, :num_fg] = torch.randint(0, H, (num_fg,), device=device)
+                    u_idx[b, :num_fg] = torch.randint(0, W, (num_fg,), device=device)
+                    
+                # Randomly pick background/global points for the remaining 50%
+                v_idx[b, num_fg:] = torch.randint(0, H, (num_bg,), device=device)
+                u_idx[b, num_fg:] = torch.randint(0, W, (num_bg,), device=device)
+                
+            u = (u_idx.float() / (W - 1)) * 2.0 - 1.0
+            v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
         
         # 2. Map coordinates based on strict ANSYS camera positions
         if v == 0: # Side 1 (Camera at +X, looking at -X)
@@ -70,14 +95,11 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
         origins_list.append(orig)
         directions_list.append(dirs)
         
-        # 3. Extract the RGB values: [B, samples_per_view, 3]
+        # 3. Extract the RGB values safely
+        view_frames = target_frames[:, v]
+        view_frames = view_frames.permute(0, 2, 3, 1)
+        
         batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(B, samples_per_view)
-        
-        # FIX: Isolate the view, permute Channels to the end, then index safely.
-        view_frames = target_frames[:, v]                 # Shape: [B, C, H, W]
-        view_frames = view_frames.permute(0, 2, 3, 1)     # Shape: [B, H, W, C]
-        
-        # Now indexing pulls directly into [B, samples_per_view, C]
         rgb = view_frames[batch_indices, v_idx, u_idx, :] 
         target_rgb_list.append(rgb)
 
