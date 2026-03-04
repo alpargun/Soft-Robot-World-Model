@@ -34,7 +34,11 @@ def main():
     IMAGE_MODE = "mask" # MUST match train.py!
     
     GRID_RES = 128  # Resolution of the 3D bounding box (128x128x128 = 2M points)
-    DENSITY_THRESHOLD = 5.0  # Changes how "thick" the solid mesh is. Lower = more transparent, Higher = more solid.
+    
+    # --- CRITICAL FIX FOR 1-CHANNEL MASK ---
+    # Values range from 0.0 to 1.0. Set to 0.5 to find the exact boundary of the rubber.
+    DENSITY_THRESHOLD = 0.5  
+    
     CHUNK_SIZE = 100000  # Process points in chunks so your Mac's RAM doesn't crash
     
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")

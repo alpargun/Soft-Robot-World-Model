@@ -27,7 +27,7 @@ def main():
     
     FEATURE_DIM = 32
     FPS = 30
-    IMAGE_MODE = "mask" 
+    IMAGE_MODE = "mask" # MUST match what you used in train.py!
 
     # Check for GPU
     if torch.cuda.is_available():
@@ -83,6 +83,7 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out_video = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, FPS, (video_width, video_height))
     
+    # Initialize ConvGRU memory for hysteresis
     hidden_state = None
     
     # Encode ONLY the very first frame to establish the initial 3D state
@@ -94,7 +95,7 @@ def main():
             print(f"Rendering Frame {t+1}/{Time-1}...")
             action_t = pressures[:, t]
             
-            # 1. Predict the NEXT 3D state based on the applied pressure
+            # 1. Predict the NEXT 3D state based on the applied pressure & hidden memory
             planes_next_pred, hidden_state = dynamics(tri_planes_t, action_t, hidden_state)
             
             # 2. Render all 4 predicted views from the 3D planes (Visualization Only)
@@ -103,8 +104,10 @@ def main():
             
             for v in range(Views):
                 ray_origins, ray_dirs = get_full_image_rays(H, W, view_idx=v, device=device)
-                ray_origins = ray_origins.unsqueeze(0) # Add batch dimension: [1, num_rays, 3]
+                ray_origins = ray_origins.unsqueeze(0) 
                 ray_dirs = ray_dirs.unsqueeze(0)
+                
+                # Render the 1-channel geometry and duplicate to 3 for OpenCV
                 single_plane_pred = {k: val[0:1] for k, val in planes_next_pred.items()}
                 rgb_pred = ray_marcher.render_rays(decoder, single_plane_pred, ray_origins, ray_dirs)
 
@@ -114,7 +117,7 @@ def main():
                 pred_img = cv2.cvtColor(pred_img, cv2.COLOR_RGB2BGR) 
                 pred_views_np.append(pred_img)
                 
-                # Extract Real Target Frame for comparison
+                # Extract Real Target Frame for side-by-side comparison
                 real_target = real_videos[0, t+1, v].permute(1, 2, 0).cpu().numpy()
                 real_target = (np.clip(real_target, 0, 1) * 255).astype(np.uint8)
                 real_target = cv2.cvtColor(real_target, cv2.COLOR_RGB2BGR)
@@ -124,7 +127,7 @@ def main():
             top_row = np.hstack(real_views_np) # Real ANSYS views
             bottom_row = np.hstack(pred_views_np) # AI Predicted views
             combined_frame = np.vstack((top_row, bottom_row))
-            out_video.write(combined_frame) # Write to video file
+            out_video.write(combined_frame) 
             
             # 4. === THE LATENT FIX ===
             # Feed the pure 3D prediction directly back into the physics engine!
