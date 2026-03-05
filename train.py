@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 # Import custom modules
 from multiview_dataset import SoftRobotDataset
@@ -92,7 +93,8 @@ def main():
         # Calculate Teacher Forcing Ratio
         tf_ratio = max(0.0, 1.0 - (epoch / (NUM_EPOCHS * 0.5)))
         
-        for batch_idx, batch in enumerate(dataloader):
+        # Wraps the dataloader to show a progress bar for the current epoch
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
             videos = batch["video"].to(device)       
             pressures = batch["pressures"].to(device) # Pressures are pre-normalized by Dataset!
             
