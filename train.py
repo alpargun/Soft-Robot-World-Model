@@ -55,7 +55,14 @@ def main():
     
     # ===========================================================================================================
     # FULL DATASET ENABLED: We use the full dataset to properly learn the hysteresis curve across all cases
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    
+    # --- NEW VALIDATION SPLIT LOGIC ---
+    val_size = 6
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False) # Batch 1 for clean, sequential validation evaluation
     
     # OVERFIT TEST: Commented out for production run.
     # overfit_dataset = Subset(dataset, indices=[-1, -2]) 
@@ -90,8 +97,9 @@ def main():
         
         epoch_loss = 0.0
         
-        # Calculate Teacher Forcing Ratio
-        tf_ratio = max(0.0, 1.0 - (epoch / (NUM_EPOCHS * 0.5)))
+        # --- FASTER TF DECAY ---
+        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 100 to force autoregressive learning sooner
+        tf_ratio = max(0.0, 1.0 - (epoch / 100.0))
         
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
@@ -183,8 +191,42 @@ def main():
         scheduler.step()
             
         avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | TF Ratio: {tf_ratio:.2f} | Avg Seq Loss: {avg_loss:.6f}")
+        
+        # ==========================================
+        # --- VALIDATION PHASE ---
+        # ==========================================
+        encoder.eval()
+        dynamics.eval()
+        decoder.eval()
+        val_loss = 0.0
+        
+        with torch.no_grad():
+            for batch in val_loader:
+                vids_val = batch["video"].to(device)
+                press_val = batch["pressures"].to(device)
+                _, V_Time, _, _, _, _ = vids_val.shape
+                
+                # Validation is ALWAYS 100% Autoregressive (No Teacher Forcing) to test true physics learning
+                curr_planes = encoder(vids_val[:, 0])
+                h_val = None
+                
+                for t in range(V_Time - 1):
+                    pred_planes, h_val = dynamics(curr_planes, press_val[:, t], h_val)
+                    
+                    # Compute fast L1 loss on rays to track generalization
+                    ray_o, ray_d, target = sample_orthographic_rays(vids_val[:, t+1], num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
+                    rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
+                    
+                    val_loss += l1_loss_fn(rgb_p, target).item()
+                    
+                    # Strictly feed prediction back into the engine
+                    curr_planes = pred_planes
+                    
+        avg_val_loss = val_loss / (len(val_loader) * (V_Time - 1))
+        
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | TF Ratio: {tf_ratio:.2f} | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
+        writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
         writer.add_scalar('Training/TF_Ratio', tf_ratio, epoch + 1)
         # Optional: track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
