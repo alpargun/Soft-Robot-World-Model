@@ -81,8 +81,14 @@ def main():
     # Added weight decay to prevent FiLM Shift (beta) parameters from growing too large and ignoring inputs
     optimizer = optim.Adam(all_params, lr=LEARNING_RATE, weight_decay=1e-5)
     
-    # StepLR cuts the learning rate in half every 100 epochs to refine delicate physical bends
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
+    # Cosine Annealing with Warm Restarts: T_0 is the first cycle length, T_mult multiplies the cycle length after each restart
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
+    # - Epochs 0-49: LR decays from 1e-4 to 1e-6: Gently learn basic 3D geometry and dynamics with Teacher Forcing still active
+    # - Epoch 50: LR jumps back to 1e-4: This "warm restart" jolts the ConvGRU out of any lazy memorization habits right as the Teacher Forcing ratio drops below 0.50.
+    # - Epochs 50-149: LR decays from 1e-4 to 1e-6
+    # - Epochs 150-349: LR decays from 1e-4 to 1e-6
+    # - Epochs 350-749: LR decays from 1e-4 to 1e-6
+    # This cycle allows the model to escape local minima and encourages better convergence, especially in the later stages of training
     
     l1_loss_fn = nn.L1Loss() 
     
