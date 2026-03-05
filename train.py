@@ -45,10 +45,12 @@ def main():
 
     print(f"Initializing World Model Training on: {device} | Mode: {IMAGE_MODE.upper()}")
 
-    # Initialize TensorBoard Writer
+    # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    writer = SummaryWriter(log_dir=f"runs/SoftRobot_Train_{IMAGE_MODE.upper()}_{timestamp}")
-    print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
+    log_dir = f"runs/SoftRobot_Train_{IMAGE_MODE.upper()}_{timestamp}"
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
+    print(f"Checkpoints will be saved to: {log_dir}")
 
     # 2. Initialize Dataset
     dataset = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
@@ -94,6 +96,9 @@ def main():
     
     if IMAGE_MODE == "rgb":
         lpips_loss_fn = lpips.LPIPS(net='vgg').to(device) 
+
+    # Track the best validation loss
+    best_val_loss = float('inf')
 
     # 5. The Training Loop
     for epoch in range(NUM_EPOCHS):
@@ -237,12 +242,26 @@ def main():
         # Optional: track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
+        # ==========================================
+        # --- CHECKPOINT SAVING ---
+        # ==========================================
+        # Save the best overall model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save({
+                'encoder': encoder.state_dict(),
+                'dynamics': dynamics.state_dict(),
+                'decoder': decoder.state_dict(),
+            }, os.path.join(log_dir, "best_model.pth"))
+            print(f"*** New Best Model Saved (Val Loss: {best_val_loss:.6f}) ***")
+
+        # Save milestone checkpoints every 50 epochs
         if (epoch + 1) % 50 == 0:
             torch.save({
                 'encoder': encoder.state_dict(),
                 'dynamics': dynamics.state_dict(),
                 'decoder': decoder.state_dict(),
-            }, f"world_model_checkpoint_epoch_{epoch+1}.pth")
+            }, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
 
     writer.close()
 
