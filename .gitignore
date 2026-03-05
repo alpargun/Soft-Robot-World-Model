@@ -12,6 +12,8 @@ runs/
 training_renders/
 *.mp4
 TODO.md
+*.docx
+/latex
 
 
 # GENERAL PYTHON GITIGNORE TEMPLATE
