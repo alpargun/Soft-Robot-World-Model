@@ -21,9 +21,9 @@ def main():
     # --- 1. CONFIGURATION ---
     # ==========================================
     DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    CHECKPOINT_PATH = "world_model_checkpoint_epoch_500.pth"
+    CHECKPOINT_PATH = "world_model_checkpoint_epoch_200.pth"
     TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    OUTPUT_VIDEO_PATH = f"AI_Prediction_SideBySide_{TIMESTAMP}.mp4"
+    OUTPUT_VIDEO_PATH = f"96_cases_200epoch_SideBySide_{TIMESTAMP}.mp4"
     
     FEATURE_DIM = 32
     FPS = 30
@@ -113,6 +113,10 @@ def main():
 
                 # Convert Prediction to Numpy Image (0-255 scale)
                 pred_img = rgb_pred.view(H, W, 3).cpu().numpy()
+                
+                # === THE BINARY THRESHOLD FIX ===
+                pred_img = (pred_img > 0.5).astype(np.float32)
+                
                 pred_img = (np.clip(pred_img, 0, 1) * 255).astype(np.uint8)
                 pred_img = cv2.cvtColor(pred_img, cv2.COLOR_RGB2BGR) 
                 pred_views_np.append(pred_img)
