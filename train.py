@@ -21,6 +21,18 @@ from volumetric_ray_marcher import VolumetricRayMarcher
 from orthographic_ray_generator import sample_orthographic_rays
 from visualization_helper import get_full_image_rays
 
+
+def dice_loss(pred, target, smooth=1e-5):
+    # Flatten tensors to calculate spatial overlap
+    pred_flat = pred.contiguous().view(-1)
+    target_flat = target.contiguous().view(-1)
+    
+    intersection = (pred_flat * target_flat).sum()
+    # Dice formula: 2 * Intersection / (Pred_Area + Target_Area)
+    dice_coeff = (2.0 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+    
+    return 1.0 - dice_coeff
+
 def main():
     # 1. Configuration
     DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
@@ -47,7 +59,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/SoftRobot_Train_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/96cases_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -92,7 +104,11 @@ def main():
     # - Epochs 350-749: LR decays from 1e-4 to 1e-6
     # This cycle allows the model to escape local minima and encourages better convergence, especially in the later stages of training
     
-    l1_loss_fn = nn.L1Loss() 
+    # Define Loss Functions
+    # L1 is kept ONLY for validation tracking (it is a good human-readable error metric)
+    l1_loss_fn = nn.L1Loss() # L1 is highly forgiving of the fuzzy smearing so we see robot expanding like a balloon. Switched to BCE + Dice for sharper edges and better spatial overlap.
+    # # Use BCE for hard edges, Dice for spatial overlap
+    bce_loss_fn = nn.BCELoss()
     
     if IMAGE_MODE == "rgb":
         lpips_loss_fn = lpips.LPIPS(net='vgg').to(device) 
@@ -138,8 +154,12 @@ def main():
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(frames_next_true, num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                 rgb_pred = ray_marcher.render_rays(decoder, planes_next_pred, ray_origins, ray_dirs)
                 
-                # 1. Standard L1 Loss (Works on the flat [B, RAYS, 3] tensors)
-                step_loss = l1_loss_fn(rgb_pred, target_rgb)
+                # 1. Combined BCE and Dice Loss for expanding geometric masks
+                loss_bce = bce_loss_fn(rgb_pred, target_rgb)
+                loss_dice = dice_loss(rgb_pred, target_rgb)
+                
+                # Weight them equally
+                step_loss = loss_bce + loss_dice
                 
                 # 2. Perceptual LPIPS Loss (Requires 2D image patches)
                 if IMAGE_MODE == "rgb":
@@ -174,7 +194,8 @@ def main():
                 # ---------------------------------------------------------
                 # VISUALIZATION BLOCK (All 4 Views -> TensorBoard)
                 # ---------------------------------------------------------
-                if (epoch + 1) % 10 == 0 and batch_idx == 0 and t == (Time - 2):
+                # Log at the peak of the inflation cycle (the middle of the sequence) so we don't always see the initial state or the fully expanded state
+                if (epoch + 1) % 10 == 0 and batch_idx == 0 and t == (Time // 2):
                     with torch.no_grad():
                         for v in range(Views):
                             real_frame = frames_next_true[0, v].detach().cpu()
@@ -228,7 +249,10 @@ def main():
                     ray_o, ray_d, target = sample_orthographic_rays(vids_val[:, t+1], num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
-                    val_loss += l1_loss_fn(rgb_p, target).item()
+                    # === USE THE HYBRID BCE+DICE LOSS FOR VALIDATION ===
+                    loss_bce_val = bce_loss_fn(rgb_p, target)
+                    loss_dice_val = dice_loss(rgb_p, target)
+                    val_loss += (loss_bce_val + loss_dice_val).item()
                     
                     # Strictly feed prediction back into the engine
                     curr_planes = pred_planes
