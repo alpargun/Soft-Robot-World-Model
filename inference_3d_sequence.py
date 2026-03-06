@@ -27,7 +27,7 @@ def main():
     # ==========================================
     # --- 1. CONFIGURATION ---
     # ==========================================
-    DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
+    DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
     CHECKPOINT_PATH = "world_model_checkpoint_epoch_500.pth"
     
     FEATURE_DIM = 32

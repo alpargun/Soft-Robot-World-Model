@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Subset
 # Import your custom modules
 from multiview_dataset import SoftRobotDataset
 from encoder import ResNetTriPlaneEncoder
+from encoder_mini import MiniResNetTriPlaneEncoder
 from temporal_dynamics import TriPlaneDynamics
 from decoder import TriPlaneDecoder
 from volumetric_ray_marcher import VolumetricRayMarcher
@@ -20,10 +21,10 @@ def main():
     # ==========================================
     # --- 1. CONFIGURATION ---
     # ==========================================
-    DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    CHECKPOINT_PATH = "world_model_checkpoint_epoch_200.pth"
+    DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
+    CHECKPOINT_PATH = "runs/miniresnet_100cases_MASK_2026-03-05_23-33-28/best_model.pth"
     TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    OUTPUT_VIDEO_PATH = f"96_cases_200epoch_SideBySide_{TIMESTAMP}.mp4"
+    OUTPUT_VIDEO_PATH = f"miniResNet100_cases_SideBySide_{TIMESTAMP}.mp4"
     
     FEATURE_DIM = 32
     FPS = 30
@@ -41,7 +42,7 @@ def main():
     # ==========================================
     # --- 2. LOAD THE TRAINED MODEL ---
     # ==========================================
-    encoder = ResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    encoder = MiniResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
@@ -52,25 +53,25 @@ def main():
         encoder.load_state_dict(checkpoint['encoder'])
         dynamics.load_state_dict(checkpoint['dynamics'])
         decoder.load_state_dict(checkpoint['decoder'])
-    else:
-        print(f"Error: Could not find {CHECKPOINT_PATH}.")
-        return
 
-    encoder.eval()
-    dynamics.eval()
+    # CRITICAL: Keep these in train mode to bypass corrupted moving averages!
+    encoder.train()
+    dynamics.train()
     decoder.eval()
 
     # ==========================================
     # --- 3. GET A TEST SEQUENCE ---
     # ==========================================
     full_dataset = SoftRobotDataset(run_folder=DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
-    test_dataset = Subset(full_dataset, indices=[-1]) 
-    dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    
+    # THE FIX: Load TWO DISTINCT runs to give BatchNorm actual variance!
+    test_dataset = Subset(full_dataset, indices=[-1, -2]) 
+    dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False)
     
     batch = next(iter(dataloader))
-    real_videos = batch["video"].to(device) # [B=1, Time=60, Views=4, C=3, H=128, W=128]     
-    pressures = batch["pressures"].to(device) # [B=1, Time=60, 3]
-    
+    real_videos = batch["video"].to(device)    # Shape will be [2, 60, 4, 3, 128, 128]
+    pressures = batch["pressures"].to(device)  # Shape will be [2, 60, 3]
+
     _, Time, Views, C, H, W = real_videos.shape
 
     # ==========================================
@@ -83,10 +84,9 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out_video = cv2.VideoWriter(OUTPUT_VIDEO_PATH, fourcc, FPS, (video_width, video_height))
     
-    # Initialize ConvGRU memory for hysteresis
     hidden_state = None
     
-    # Encode ONLY the very first frame to establish the initial 3D state
+    # Encode both starting frames simultaneously
     current_frames = real_videos[:, 0] 
     tri_planes_t = encoder(current_frames)
 
@@ -95,10 +95,9 @@ def main():
             print(f"Rendering Frame {t+1}/{Time-1}...")
             action_t = pressures[:, t]
             
-            # 1. Predict the NEXT 3D state based on the applied pressure & hidden memory
+            # Predict the next state for BOTH sequences
             planes_next_pred, hidden_state = dynamics(tri_planes_t, action_t, hidden_state)
             
-            # 2. Render all 4 predicted views from the 3D planes (Visualization Only)
             pred_views_np = []
             real_views_np = []
             
@@ -107,34 +106,26 @@ def main():
                 ray_origins = ray_origins.unsqueeze(0) 
                 ray_dirs = ray_dirs.unsqueeze(0)
                 
-                # Render the 1-channel geometry and duplicate to 3 for OpenCV
+                # EXTRACT ONLY INDEX 0 FOR RENDERING THE VIDEO
                 single_plane_pred = {k: val[0:1] for k, val in planes_next_pred.items()}
                 rgb_pred = ray_marcher.render_rays(decoder, single_plane_pred, ray_origins, ray_dirs)
 
-                # Convert Prediction to Numpy Image (0-255 scale)
                 pred_img = rgb_pred.view(H, W, 3).cpu().numpy()
-                
-                # === THE BINARY THRESHOLD FIX ===
-                pred_img = (pred_img > 0.5).astype(np.float32)
-                
                 pred_img = (np.clip(pred_img, 0, 1) * 255).astype(np.uint8)
                 pred_img = cv2.cvtColor(pred_img, cv2.COLOR_RGB2BGR) 
                 pred_views_np.append(pred_img)
                 
-                # Extract Real Target Frame for side-by-side comparison
+                # Extract real target from index 0
                 real_target = real_videos[0, t+1, v].permute(1, 2, 0).cpu().numpy()
                 real_target = (np.clip(real_target, 0, 1) * 255).astype(np.uint8)
                 real_target = cv2.cvtColor(real_target, cv2.COLOR_RGB2BGR)
                 real_views_np.append(real_target)
                 
-            # 3. Stitch Images Together
-            top_row = np.hstack(real_views_np) # Real ANSYS views
-            bottom_row = np.hstack(pred_views_np) # AI Predicted views
+            top_row = np.hstack(real_views_np) 
+            bottom_row = np.hstack(pred_views_np) 
             combined_frame = np.vstack((top_row, bottom_row))
             out_video.write(combined_frame) 
             
-            # 4. === THE LATENT FIX ===
-            # Feed the pure 3D prediction directly back into the physics engine!
             tri_planes_t = planes_next_pred
 
     out_video.release()

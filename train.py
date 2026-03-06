@@ -15,6 +15,7 @@ from tqdm import tqdm
 # Import custom modules
 from multiview_dataset import SoftRobotDataset
 from encoder import ResNetTriPlaneEncoder
+from encoder_mini import MiniResNetTriPlaneEncoder
 from temporal_dynamics import TriPlaneDynamics
 from decoder import TriPlaneDecoder
 from volumetric_ray_marcher import VolumetricRayMarcher
@@ -35,7 +36,7 @@ def dice_loss(pred, target, smooth=1e-5):
 
 def main():
     # 1. Configuration
-    DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
+    DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
     IMAGE_MODE = "mask" # Change to "rgb" to automatically enable LPIPS perceptual loss!
     
     BATCH_SIZE = 2 # or 4 if GPU memory allows
@@ -59,7 +60,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/96cases_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/miniresnet_100cases_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -84,7 +85,8 @@ def main():
     # ===========================================================================================================
 
     # 3. Initialize Model Components
-    encoder = ResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    #encoder = ResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    encoder = MiniResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
@@ -286,6 +288,13 @@ def main():
                 'dynamics': dynamics.state_dict(),
                 'decoder': decoder.state_dict(),
             }, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
+            
+        # ALWAYS save the latest state so progress is never lost during sudden stops
+        torch.save({
+            'encoder': encoder.state_dict(),
+            'dynamics': dynamics.state_dict(),
+            'decoder': decoder.state_dict(),
+        }, os.path.join(log_dir, "last_checkpoint.pth"))
 
     writer.close()
 

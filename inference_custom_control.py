@@ -20,7 +20,7 @@ def main():
     # ==========================================
     # --- 1. CONFIGURATION ---
     # ==========================================
-    DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
+    DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
     CHECKPOINT_PATH = "world_model_checkpoint_epoch_210.pth" # Ensure this points to your latest!
     TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     OUTPUT_VIDEO_PATH = f"Custom_Control_AI_Rollout_{TIMESTAMP}.mp4"
