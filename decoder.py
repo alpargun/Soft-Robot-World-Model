@@ -3,21 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TriPlaneDecoder(nn.Module):
-    def __init__(self, feature_dim=32, hidden_dim=64, image_mode="mask"):
+    def __init__(self, feature_dim=64, hidden_dim=64, image_mode="mask"):
         super().__init__()
         
         self.image_mode = image_mode
         # Toggle output channels based on the mode
         out_channels = 1 if image_mode == "mask" else 3
         
+        # CRITICAL FIX: The input is now feature_dim * 3 because we concatenate the 3 planes
         self.mlp = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
+            nn.Linear(feature_dim * 3, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True)
         )
         
-        # Output channel depends on image_mode
         self.color_head = nn.Sequential(
             nn.Linear(hidden_dim, out_channels),
             nn.Sigmoid() 
@@ -54,8 +54,7 @@ class TriPlaneDecoder(nn.Module):
             density: Predicted solidness [B, N_points, 1]
         """
         # 1. Project the 3D points onto the 3 orthogonal 2D planes
-        # points_3d is (X, Y, Z)
-        coords_xy = points_3d[..., [0, 1]] 
+        coords_xy = points_3d[..., [0, 1]] # points_3d is (X, Y, Z)
         coords_xz = points_3d[..., [0, 2]]
         coords_yz = points_3d[..., [1, 2]]
         
@@ -64,13 +63,13 @@ class TriPlaneDecoder(nn.Module):
         feat_xz = self.sample_plane(tri_planes['xz'], coords_xz)
         feat_yz = self.sample_plane(tri_planes['yz'], coords_yz)
         
-        # 3. Aggregate features (CRITICAL FIX: Multiplication forces intersection)
-        fused_features = feat_xy * feat_xz * feat_yz
+        # 3. Aggregate features (CRITICAL FIX: Concatenation)
+        # Prevents hollow T-shapes by preserving distinct plane data, and prevents autoregressive drift.
+        fused_features = torch.cat([feat_xy, feat_xz, feat_yz], dim=-1)
         
         # 4. Predict Color and Density using the MLP
         hidden = self.mlp(fused_features)
         
-        # Outputs either [B, N, 1] or [B, N, 3]
         color_out = self.color_head(hidden)
         density = self.density_head(hidden)
 

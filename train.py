@@ -15,6 +15,7 @@ from tqdm import tqdm
 # Import custom modules
 from multiview_dataset import SoftRobotDataset
 from encoder import ResNetTriPlaneEncoder
+from encoder_resnet_gn import ResNetGNTriPlaneEncoder
 from encoder_mini import MiniResNetTriPlaneEncoder
 from temporal_dynamics import TriPlaneDynamics
 from decoder import TriPlaneDecoder
@@ -40,7 +41,7 @@ def main():
     IMAGE_MODE = "mask" # Change to "rgb" to automatically enable LPIPS perceptual loss!
     
     BATCH_SIZE = 2 # or 4 if GPU memory allows
-    FEATURE_DIM = 32
+    FEATURE_DIM = 64
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 500
     RAYS_PER_STEP = 1600 # Number of rays to sample per time step for loss calculation
@@ -60,9 +61,9 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/miniresnet_100cases_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/resnetGN_decoderConcat_125cases_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
-    print(f"TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
+    print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
 
     # 2. Initialize Dataset
@@ -71,8 +72,8 @@ def main():
     # ===========================================================================================================
     # FULL DATASET ENABLED: We use the full dataset to properly learn the hysteresis curve across all cases
     
-    # --- NEW VALIDATION SPLIT LOGIC ---
-    val_size = 6
+    # --- AUTOMATIC 10% VALIDATION SPLIT ---
+    val_size = int(len(dataset) * 0.10)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
@@ -86,7 +87,8 @@ def main():
 
     # 3. Initialize Model Components
     #encoder = ResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
-    encoder = MiniResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    #encoder = MiniResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    encoder = ResNetGNTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
@@ -127,8 +129,8 @@ def main():
         epoch_loss = 0.0
         
         # --- FASTER TF DECAY ---
-        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 100 to force autoregressive learning sooner
-        tf_ratio = max(0.0, 1.0 - (epoch / 100.0))
+        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 150 to force autoregressive learning sooner
+        tf_ratio = max(0.0, 1.0 - (epoch / 150.0))
         
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
