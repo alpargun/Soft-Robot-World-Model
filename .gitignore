@@ -11,6 +11,7 @@ runs/
 
 training_renders/
 *.mp4
+*.obj
 TODO.md
 *.docx
 /latex
