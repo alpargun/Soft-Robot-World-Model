@@ -29,6 +29,9 @@ def main():
     FEATURE_DIM = 32
     FPS = 30
     IMAGE_MODE = "mask" # MUST match what you used in train.py!
+    
+    # --- NEW: POST-PROCESSING TOGGLE ---
+    APPLY_POSTPROCESSING = True # Set to False to see raw probability dust
 
     # Check for GPU
     if torch.cuda.is_available():
@@ -110,9 +113,27 @@ def main():
                 single_plane_pred = {k: val[0:1] for k, val in planes_next_pred.items()}
                 rgb_pred = ray_marcher.render_rays(decoder, single_plane_pred, ray_origins, ray_dirs)
 
+                # Fetch raw prediction
                 pred_img = rgb_pred.view(H, W, 3).cpu().numpy()
-                pred_img = (np.clip(pred_img, 0, 1) * 255).astype(np.uint8)
-                pred_img = cv2.cvtColor(pred_img, cv2.COLOR_RGB2BGR) 
+                
+                # 1. Base Binary Thresholding
+                pred_img = (pred_img > 0.5).astype(np.float32)
+                pred_img = (pred_img * 255).astype(np.uint8)
+                
+                # 2. Optional CV Cleanup (Keep only largest contour)
+                if APPLY_POSTPROCESSING:
+                    gray = cv2.cvtColor(pred_img, cv2.COLOR_RGB2GRAY)
+                    contours, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        largest_contour = max(contours, key=cv2.contourArea)
+                        clean_mask = np.zeros_like(gray)
+                        cv2.drawContours(clean_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+                        pred_img = cv2.cvtColor(clean_mask, cv2.COLOR_GRAY2BGR)
+                    else:
+                        pred_img = cv2.cvtColor(pred_img, cv2.COLOR_RGB2BGR)
+                else:
+                    pred_img = cv2.cvtColor(pred_img, cv2.COLOR_RGB2BGR)
+                
                 pred_views_np.append(pred_img)
                 
                 # Extract real target from index 0

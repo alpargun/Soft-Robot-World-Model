@@ -160,10 +160,17 @@ def main():
                 loss_bce = bce_loss_fn(rgb_pred, target_rgb)
                 loss_dice = dice_loss(rgb_pred, target_rgb)
                 
-                # Weight them equally
-                step_loss = loss_bce + loss_dice
+                # 2. 3D Sparsity Loss (To prevent Extrusion Artifacts and keep actuator hollow)
+                # Sample 1024 random 3D coordinates in the bounding box [-1, 1]^3
+                random_points_3d = (torch.rand(B, 1024, 3, device=device) * 2.0) - 1.0
+                random_probs, _ = decoder(planes_next_pred, random_points_3d)
+                sparsity_loss = torch.mean(random_probs)
+                lambda_sparse = 0.01 # Gentle penalty to carve away floating mass without collapsing the main geometry
                 
-                # 2. Perceptual LPIPS Loss (Requires 2D image patches)
+                # Weight them equally, adding the sparsity penalty
+                step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
+                
+                # 3. Perceptual LPIPS Loss (Requires 2D image patches)
                 if IMAGE_MODE == "rgb":
                     # Calculate the dimension of the square patch (e.g., 400 rays = 20x20 patch)
                     rays_per_view = RAYS_PER_STEP // Views

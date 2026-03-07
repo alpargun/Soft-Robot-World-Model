@@ -17,7 +17,7 @@ class TriPlaneDecoder(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Renamed to color_head since it might just output 1 channel
+        # Output channel depends on image_mode
         self.color_head = nn.Sequential(
             nn.Linear(hidden_dim, out_channels),
             nn.Sigmoid() 
@@ -64,8 +64,8 @@ class TriPlaneDecoder(nn.Module):
         feat_xz = self.sample_plane(tri_planes['xz'], coords_xz)
         feat_yz = self.sample_plane(tri_planes['yz'], coords_yz)
         
-        # 3. Aggregate features (Summing is standard for Tri-planes)
-        fused_features = feat_xy + feat_xz + feat_yz
+        # 3. Aggregate features (CRITICAL FIX: Multiplication forces intersection)
+        fused_features = feat_xy * feat_xz * feat_yz
         
         # 4. Predict Color and Density using the MLP
         hidden = self.mlp(fused_features)
