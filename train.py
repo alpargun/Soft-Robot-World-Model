@@ -43,7 +43,7 @@ def main():
     BATCH_SIZE = 2 # or 4 if GPU memory allows
     FEATURE_DIM = 64
     LEARNING_RATE = 1e-4
-    NUM_EPOCHS = 500
+    NUM_EPOCHS = 1000
     RAYS_PER_STEP = 1600 # Number of rays to sample per time step for loss calculation
     
     # Check for GPU availability
@@ -148,7 +148,8 @@ def main():
             current_tri_planes = encoder(videos[:, 0])
             
             for t in range(Time - 1):
-                action_t = pressures[:, t]        
+                # Clamp the pressure to ensure a strict floor of 1.0 and a physical ceiling of 100.0
+                action_t = torch.clamp(pressures[:, t], min=1.0, max=100.0)
                 frames_next_true = videos[:, t+1] 
                 
                 # Predict the next 3D state
@@ -162,12 +163,18 @@ def main():
                 loss_bce = bce_loss_fn(rgb_pred, target_rgb)
                 loss_dice = dice_loss(rgb_pred, target_rgb)
                 
-                # 2. 3D Sparsity Loss (To prevent Extrusion Artifacts and keep actuator hollow)
+                # 2. 3D Sparsity Loss (Entropy-based for crisp boundaries)
                 # Sample 1024 random 3D coordinates in the bounding box [-1, 1]^3
                 random_points_3d = (torch.rand(B, 1024, 3, device=device) * 2.0) - 1.0
                 random_probs, _ = decoder(planes_next_pred, random_points_3d)
-                sparsity_loss = torch.mean(random_probs)
-                lambda_sparse = 0.01 # Gentle penalty to carve away floating mass without collapsing the main geometry
+                
+                # Calculate binary entropy. Epsilon (1e-6) prevents log(0) NaN explosions.
+                eps = 1e-6
+                entropy = -random_probs * torch.log(random_probs + eps) - (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
+                sparsity_loss = torch.mean(entropy)
+                
+                # Slightly reduced lambda since maximum entropy is ~0.69 (ln 2), which scales differently than uniform mean
+                lambda_sparse = 0.005
                 
                 # Weight them equally, adding the sparsity penalty
                 step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
@@ -236,6 +243,17 @@ def main():
             
         # Step the learning rate down appropriately per epoch
         scheduler.step()
+
+        # --- DECAYING PEAK LR LOGIC ---
+        # The T_0=50, T_mult=2 schedule restarts at epochs 50, 150, and 350.
+        # We cut the maximum learning rate in half at each restart.
+        restart_epochs = [50, 150, 350]
+        if (epoch + 1) in restart_epochs:
+            for param_group in optimizer.param_groups:
+                if 'initial_lr' in param_group:
+                    param_group['initial_lr'] *= 0.5
+            scheduler.base_lrs = [base_lr * 0.5 for base_lr in scheduler.base_lrs]
+            print(f">>> LR Warm Restart: Peak decayed to {scheduler.base_lrs[0]:.6f}")
             
         avg_loss = epoch_loss / len(dataloader)
         
@@ -258,7 +276,11 @@ def main():
                 h_val = None
                 
                 for t in range(V_Time - 1):
-                    pred_planes, h_val = dynamics(curr_planes, press_val[:, t], h_val)
+                    # ADD THE EXACT SAME CLAMP TO VALIDATION
+                    action_val_clamped = torch.clamp(press_val[:, t], min=1.0, max=100.0)
+                    
+                    # Feed the clamped action into the dynamics engine
+                    pred_planes, h_val = dynamics(curr_planes, action_val_clamped, h_val)
                     
                     # Compute fast L1 loss on rays to track generalization
                     ray_o, ray_d, target = sample_orthographic_rays(vids_val[:, t+1], num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
