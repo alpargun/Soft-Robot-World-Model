@@ -129,8 +129,8 @@ def main():
         epoch_loss = 0.0
         
         # --- FASTER TF DECAY ---
-        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 150 to force autoregressive learning sooner
-        tf_ratio = max(0.0, 1.0 - (epoch / 150.0))
+        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 200 to force autoregressive learning sooner
+        tf_ratio = max(0.0, 1.0 - (epoch / 200.0))
         
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
@@ -205,8 +205,12 @@ def main():
                 # ---------------------------------------------------------
                 # VISUALIZATION BLOCK (All 4 Views -> TensorBoard)
                 # ---------------------------------------------------------
-                # Log at the peak of the inflation cycle (the middle of the sequence) so we don't always see the initial state or the fully expanded state
-                if (epoch + 1) % 10 == 0 and batch_idx == 0 and t == (Time // 2):
+                # Log both the middle frame (peak motion) and the last frame (max compounding error/hallucination)
+                if (epoch + 1) % 10 == 0 and batch_idx == 0 and (t == (Time // 2) or t == (Time - 2)):
+                    
+                    # Group them cleanly in TensorBoard
+                    stage_name = "Middle" if t == (Time // 2) else "Last"
+                    
                     with torch.no_grad():
                         for v in range(Views):
                             real_frame = frames_next_true[0, v].detach().cpu()
@@ -219,7 +223,7 @@ def main():
                             pred_frame = full_rgb_pred.view(H, W, 3).permute(2, 0, 1).detach().cpu()
                             
                             comparison_grid = torch.cat((real_frame, pred_frame), dim=2)
-                            writer.add_image(f'Comparison_View/Side_{v+1}', comparison_grid, epoch + 1)
+                            writer.add_image(f'Comparison_{stage_name}/Side_{v+1}', comparison_grid, epoch + 1)
 
             batch_sequence_loss = batch_sequence_loss / (Time - 1)
             batch_sequence_loss.backward()
