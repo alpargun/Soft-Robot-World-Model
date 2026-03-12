@@ -24,9 +24,6 @@ class SoftRobotDataset(Dataset):
         self.crop_size = crop_size
         self.image_mode = image_mode.lower()
         
-        # Cache as dictionary to hold processed data in RAM ---
-        self.cache = {}
-        
         folders = glob.glob(os.path.join(run_folder, "Case_*"))
         self.case_folders = sorted(folders, key=lambda x: int(re.search(r'Case_(\d+)', os.path.basename(x)).group(1)))
         
@@ -37,12 +34,13 @@ class SoftRobotDataset(Dataset):
         return len(self.case_folders)
 
     def __getitem__(self, idx):
-        # Skip OpenCV processing if it is in the cache
-        if idx in self.cache:
-            return self.cache[idx]
-            
         case_folder = self.case_folders[idx]
+        cache_file_path = os.path.join(case_folder, f"processed_tensor_cache_{self.image_mode}.pt")
         
+        # Skip OpenCV processing if it is in the cache (Load directly from disk)
+        if os.path.exists(cache_file_path):
+            return torch.load(cache_file_path, weights_only=True)
+            
         # 1. LOAD THE PRESSURE PROFILE
         csv_path = glob.glob(os.path.join(case_folder, "*_PressureProfile.csv"))[0]
         df = pd.read_csv(csv_path)
@@ -135,9 +133,9 @@ class SoftRobotDataset(Dataset):
         # Normalize to [0, 1] for stable neural network inputs (Assuming 100 kPa is max)
         pressures_tensor = torch.tensor(aligned_pressures_pa / 100000.0) 
 
-        # Save to RAM before returning
+        # Save to DISK before returning
         result = {"video": videos, "pressures": pressures_tensor}
-        self.cache[idx] = result
+        torch.save(result, cache_file_path)
         
         return result
 
