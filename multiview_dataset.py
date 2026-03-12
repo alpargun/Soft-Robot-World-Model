@@ -24,7 +24,7 @@ class SoftRobotDataset(Dataset):
         self.crop_size = crop_size
         self.image_mode = image_mode.lower()
         
-        # --- INJECTED FIX: Dictionary to hold processed data in RAM ---
+        # Cache as dictionary to hold processed data in RAM ---
         self.cache = {}
         
         folders = glob.glob(os.path.join(run_folder, "Case_*"))
@@ -37,7 +37,7 @@ class SoftRobotDataset(Dataset):
         return len(self.case_folders)
 
     def __getitem__(self, idx):
-        # --- INJECTED FIX: Skip OpenCV processing if we already did it ---
+        # Skip OpenCV processing if it is in the cache
         if idx in self.cache:
             return self.cache[idx]
             
@@ -125,14 +125,17 @@ class SoftRobotDataset(Dataset):
         # 3. ALIGN TIME & STRICT NORMALIZATION
         aligned_pressures = pressures_kpa[-num_frames_in_video:]
         
+        # Convert kPa to Pa to accurately map the physical values
+        aligned_pressures_pa = aligned_pressures * 1000.0
+        
         # Establishing a hard physical boundary to prevent mathematical collapse or negative vacuums
         MIN_PRESSURE = 1.0 
-        aligned_pressures = np.clip(aligned_pressures, a_min=MIN_PRESSURE, a_max=None)
+        aligned_pressures_pa = np.clip(aligned_pressures_pa, a_min=MIN_PRESSURE, a_max=100000.0)
         
         # Normalize to [0, 1] for stable neural network inputs (Assuming 100 kPa is max)
-        pressures_tensor = torch.tensor(aligned_pressures / 100.0) 
+        pressures_tensor = torch.tensor(aligned_pressures_pa / 100000.0) 
 
-        # --- INJECTED FIX: Save to RAM before returning ---
+        # Save to RAM before returning
         result = {"video": videos, "pressures": pressures_tensor}
         self.cache[idx] = result
         
