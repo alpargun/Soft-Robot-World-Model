@@ -14,9 +14,7 @@ from tqdm import tqdm
 
 # Import custom modules
 from multiview_dataset import SoftRobotDataset
-from encoder import ResNetTriPlaneEncoder
 from encoder_resnet_gn import ResNetGNTriPlaneEncoder
-from encoder_mini import MiniResNetTriPlaneEncoder
 from temporal_dynamics import TriPlaneDynamics
 from decoder import TriPlaneDecoder
 from volumetric_ray_marcher import VolumetricRayMarcher
@@ -61,7 +59,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/resnetGN_decoderConcat_125cases_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/resnetGN_decoderConcat_125cases_clampfix_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -69,25 +67,15 @@ def main():
     # 2. Initialize Dataset
     dataset = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
     
-    # ===========================================================================================================
-    # FULL DATASET ENABLED: We use the full dataset to properly learn the hysteresis curve across all cases
-    
     # --- AUTOMATIC 10% VALIDATION SPLIT ---
     val_size = int(len(dataset) * 0.10)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
     dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False) # Batch 1 for clean, sequential validation evaluation
-    
-    # OVERFIT TEST: Commented out for production run.
-    # overfit_dataset = Subset(dataset, indices=[-1, -2]) 
-    # dataloader = DataLoader(overfit_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    # ===========================================================================================================
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
     # 3. Initialize Model Components
-    #encoder = ResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
-    #encoder = MiniResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     encoder = ResNetGNTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
@@ -99,21 +87,12 @@ def main():
     # Added weight decay to prevent FiLM Shift (beta) parameters from growing too large and ignoring inputs
     optimizer = optim.Adam(all_params, lr=LEARNING_RATE, weight_decay=1e-5)
     
-    # Cosine Annealing with Warm Restarts: T_0 is the first cycle length, T_mult multiplies the cycle length after each restart
+    # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
-    # - Epochs 0-49: LR decays from 1e-4 to 1e-6: Gently learn basic 3D geometry and dynamics with Teacher Forcing still active
-    # - Epoch 50: LR jumps back to 1e-4: This "warm restart" jolts the ConvGRU out of any lazy memorization habits right as the Teacher Forcing ratio drops below 0.50.
-    # - Epochs 50-149: LR decays from 1e-4 to 1e-6
-    # - Epochs 150-349: LR decays from 1e-4 to 1e-6
-    # - Epochs 350-749: LR decays from 1e-4 to 1e-6
-    # This cycle allows the model to escape local minima and encourages better convergence, especially in the later stages of training
     
     # Define Loss Functions
-    # L1 is kept ONLY for validation tracking (it is a good human-readable error metric)
-    l1_loss_fn = nn.L1Loss() # L1 is highly forgiving of the fuzzy smearing so we see robot expanding like a balloon. Switched to BCE + Dice for sharper edges and better spatial overlap.
-    # # Use BCE for hard edges, Dice for spatial overlap
-    bce_loss_fn = nn.BCELoss()
-    
+    bce_loss_fn = nn.BCELoss() # Use BCE instead of L1 for sharper edges, Dice for better spatial overlap
+
     if IMAGE_MODE == "rgb":
         lpips_loss_fn = lpips.LPIPS(net='vgg').to(device) 
 
@@ -156,7 +135,8 @@ def main():
                 planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
                 
                 # Render the current frame
-                ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(frames_next_true, num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
+                ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
+                    frames_next_true, num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                 rgb_pred = ray_marcher.render_rays(decoder, planes_next_pred, ray_origins, ray_dirs)
                 
                 # 1. Combined BCE and Dice Loss for expanding geometric masks
@@ -170,10 +150,11 @@ def main():
                 
                 # Calculate binary entropy. Epsilon (1e-6) prevents log(0) NaN explosions.
                 eps = 1e-6
-                entropy = -random_probs * torch.log(random_probs + eps) - (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
+                entropy = -random_probs * torch.log(random_probs + eps) -\
+                    (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
                 sparsity_loss = torch.mean(entropy)
                 
-                # Slightly reduced lambda since maximum entropy is ~0.69 (ln 2), which scales differently than uniform mean
+                # Slightly reduced lambda as max entropy is ~0.69 (ln 2), which scales differently than uniform mean
                 lambda_sparse = 0.005
                 
                 # Weight them equally, adding the sparsity penalty
@@ -226,7 +207,8 @@ def main():
                             full_ray_dirs = full_ray_dirs.unsqueeze(0)
                             
                             single_plane_pred = {key: planes_next_pred[key][0:1] for key in planes_next_pred} 
-                            full_rgb_pred = ray_marcher.render_rays(decoder, single_plane_pred, full_ray_origins, full_ray_dirs)
+                            full_rgb_pred = ray_marcher.render_rays(
+                                decoder, single_plane_pred, full_ray_origins, full_ray_dirs)
                             pred_frame = full_rgb_pred.view(H, W, 3).permute(2, 0, 1).detach().cpu()
                             
                             comparison_grid = torch.cat((real_frame, pred_frame), dim=2)
@@ -245,13 +227,11 @@ def main():
         scheduler.step()
 
         # --- DECAYING PEAK LR LOGIC ---
-        # The T_0=50, T_mult=2 schedule restarts at epochs 50, 150, and 350.
-        # We cut the maximum learning rate in half at each restart.
-        restart_epochs = [50, 150, 350]
+        restart_epochs = [50, 150, 350] # The T_0=50, T_mult=2 schedule restarts at epochs 50, 150, and 350.
         if (epoch + 1) in restart_epochs:
             for param_group in optimizer.param_groups:
                 if 'initial_lr' in param_group:
-                    param_group['initial_lr'] *= 0.5
+                    param_group['initial_lr'] *= 0.5 # Cut the maximum learning rate in half at each restart.
             scheduler.base_lrs = [base_lr * 0.5 for base_lr in scheduler.base_lrs]
             print(f">>> LR Warm Restart: Peak decayed to {scheduler.base_lrs[0]:.6f}")
             
@@ -283,7 +263,8 @@ def main():
                     pred_planes, h_val = dynamics(curr_planes, action_val_clamped, h_val)
                     
                     # Compute fast L1 loss on rays to track generalization
-                    ray_o, ray_d, target = sample_orthographic_rays(vids_val[:, t+1], num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
+                    ray_o, ray_d, target = sample_orthographic_rays(
+                        vids_val[:, t+1], num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
                     # === USE THE HYBRID BCE+DICE LOSS FOR VALIDATION ===
@@ -296,7 +277,8 @@ def main():
                     
         avg_val_loss = val_loss / (len(val_loader) * (V_Time - 1))
         
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | TF Ratio: {tf_ratio:.2f} | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | TF Ratio: {tf_ratio:.2f} |\
+            Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
         writer.add_scalar('Training/TF_Ratio', tf_ratio, epoch + 1)
