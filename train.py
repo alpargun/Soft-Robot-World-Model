@@ -148,8 +148,8 @@ def main():
             current_tri_planes = encoder(videos[:, 0])
             
             for t in range(Time - 1):
-                # Clamp the pressure to ensure a strict floor of 1.0 and a physical ceiling of 100.0
-                action_t = torch.clamp(pressures[:, t], min=1.0, max=100.0)
+                # Clamp the pressure to ensure a strict floor of 1.0 and a physical ceiling of 100000.0
+                action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
                 frames_next_true = videos[:, t+1] 
                 
                 # Predict the next 3D state
@@ -277,7 +277,7 @@ def main():
                 
                 for t in range(V_Time - 1):
                     # ADD THE EXACT SAME CLAMP TO VALIDATION
-                    action_val_clamped = torch.clamp(press_val[:, t], min=1.0, max=100.0)
+                    action_val_clamped = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
                     
                     # Feed the clamped action into the dynamics engine
                     pred_planes, h_val = dynamics(curr_planes, action_val_clamped, h_val)

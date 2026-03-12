@@ -69,8 +69,8 @@ def main():
     full_dataset = SoftRobotDataset(run_folder=DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
     
     # THE FIX: Load TWO DISTINCT runs to give BatchNorm actual variance!
-    test_dataset = Subset(full_dataset, indices=[60, 61]) 
-    dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False)
+    test_dataset = Subset(full_dataset, indices=[-60]) 
+    dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
     batch = next(iter(dataloader))
     real_videos = batch["video"].to(device)    # Shape will be [2, 60, 4, 3, 128, 128]
@@ -100,7 +100,7 @@ def main():
             
             # CLAMP
             # Ensure pressures strictly stay within the bounds established during training.
-            action_t = torch.clamp(pressures[:, t], min=1.0, max=100.0)
+            action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
             
             # Predict the next state for BOTH sequences
             planes_next_pred, hidden_state = dynamics(tri_planes_t, action_t, hidden_state)
