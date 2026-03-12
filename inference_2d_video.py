@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, Subset
 from multiview_dataset import SoftRobotDataset
 from encoder import ResNetTriPlaneEncoder
 from encoder_mini import MiniResNetTriPlaneEncoder
+from encoder_resnet_gn import ResNetGNTriPlaneEncoder
 from temporal_dynamics import TriPlaneDynamics
 from decoder import TriPlaneDecoder
 from volumetric_ray_marcher import VolumetricRayMarcher
@@ -22,11 +23,11 @@ def main():
     # --- 1. CONFIGURATION ---
     # ==========================================
     DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    CHECKPOINT_PATH = "runs/miniresnet_100cases_MASK_2026-03-05_23-33-28/best_model.pth"
+    CHECKPOINT_PATH = "runs/resnetGN_decoderConcat_125cases_MASK_2026-03-09_03-33-10/last_checkpoint.pth"
     TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    OUTPUT_VIDEO_PATH = f"miniResNet100_cases_SideBySide_{TIMESTAMP}.mp4"
+    OUTPUT_VIDEO_PATH = f"resnetGN_v2_125_cases_SideBySide_{TIMESTAMP}.mp4"
     
-    FEATURE_DIM = 32
+    FEATURE_DIM = 64
     FPS = 30
     IMAGE_MODE = "mask" # MUST match what you used in train.py!
     
@@ -45,7 +46,7 @@ def main():
     # ==========================================
     # --- 2. LOAD THE TRAINED MODEL ---
     # ==========================================
-    encoder = MiniResNetTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    encoder = ResNetGNTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
@@ -57,9 +58,9 @@ def main():
         dynamics.load_state_dict(checkpoint['dynamics'])
         decoder.load_state_dict(checkpoint['decoder'])
 
-    # CRITICAL: Keep these in train mode to bypass corrupted moving averages!
-    encoder.train()
-    dynamics.train()
+    # Set eval mode
+    encoder.eval()
+    dynamics.eval()
     decoder.eval()
 
     # ==========================================
@@ -68,7 +69,7 @@ def main():
     full_dataset = SoftRobotDataset(run_folder=DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
     
     # THE FIX: Load TWO DISTINCT runs to give BatchNorm actual variance!
-    test_dataset = Subset(full_dataset, indices=[-1, -2]) 
+    test_dataset = Subset(full_dataset, indices=[60, 61]) 
     dataloader = DataLoader(test_dataset, batch_size=2, shuffle=False)
     
     batch = next(iter(dataloader))
@@ -96,7 +97,10 @@ def main():
     with torch.no_grad():
         for t in range(Time - 1):
             print(f"Rendering Frame {t+1}/{Time-1}...")
-            action_t = pressures[:, t]
+            
+            # CLAMP
+            # Ensure pressures strictly stay within the bounds established during training.
+            action_t = torch.clamp(pressures[:, t], min=1.0, max=100.0)
             
             # Predict the next state for BOTH sequences
             planes_next_pred, hidden_state = dynamics(tri_planes_t, action_t, hidden_state)
