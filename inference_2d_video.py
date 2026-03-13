@@ -23,9 +23,13 @@ def main():
     # --- 1. CONFIGURATION ---
     # ==========================================
     DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    CHECKPOINT_PATH = "runs/resnetGN_decoderConcat_125cases_MASK_2026-03-09_03-33-10/last_checkpoint.pth"
+    CHECKPOINT_PATH = "runs/resnetGN_decoderConcat_125cases_clampfix_MASK_2026-03-12_01-10-53/last_checkpoint.pth"
     TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    OUTPUT_VIDEO_PATH = f"resnetGN_v2_125_cases_SideBySide_{TIMESTAMP}.mp4"
+    
+    # Set output path
+    VIDEOS_DIR = "generated_vids"
+    os.makedirs(VIDEOS_DIR, exist_ok=True)
+    OUTPUT_VIDEO_PATH = f"{VIDEOS_DIR}/clampfix_125_cases_SideBySide_{TIMESTAMP}.mp4"
     
     FEATURE_DIM = 64
     FPS = 30
