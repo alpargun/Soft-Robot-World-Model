@@ -73,7 +73,7 @@ def main():
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
     dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     # 3. Initialize Model Components
     encoder = ResNetGNTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
