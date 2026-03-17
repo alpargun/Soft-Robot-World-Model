@@ -1,6 +1,7 @@
 import os
 import glob
 import re
+import random
 
 import cv2
 import torch
@@ -11,7 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib import animation
 
 class SoftRobotDataset(Dataset):
-    def __init__(self, run_folder, img_size=(128, 128), crop_size=600, image_mode="mask"):
+    def __init__(self, run_folder, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=60):
         """
         Args:
             run_folder (str): Path to the main 'Run_YYYY-MM-DD_...' directory.
@@ -23,6 +24,7 @@ class SoftRobotDataset(Dataset):
         self.img_size = img_size
         self.crop_size = crop_size
         self.image_mode = image_mode.lower()
+        self.seq_len = seq_len # seq_len=60 to enforce uniform tensor sizes for PyTorch batches
         
         folders = glob.glob(os.path.join(run_folder, "Case_*"))
         self.case_folders = sorted(folders, key=lambda x: int(re.search(r'Case_(\d+)', os.path.basename(x)).group(1)))
@@ -39,105 +41,120 @@ class SoftRobotDataset(Dataset):
         
         # Skip OpenCV processing if it is in the cache (Load directly from disk)
         if os.path.exists(cache_file_path):
-            return torch.load(cache_file_path, weights_only=True)
+            result = torch.load(cache_file_path, weights_only=True)
+        else:
+            # 1. LOAD THE PRESSURE PROFILE
+            csv_path = glob.glob(os.path.join(case_folder, "*_PressureProfile.csv"))[0]
+            df = pd.read_csv(csv_path)
+            pressures_kpa = df.iloc[:, 1:4].values.astype(np.float32) 
             
-        # 1. LOAD THE PRESSURE PROFILE
-        csv_path = glob.glob(os.path.join(case_folder, "*_PressureProfile.csv"))[0]
-        df = pd.read_csv(csv_path)
-        pressures_kpa = df.iloc[:, 1:4].values.astype(np.float32) 
-        
-        # 2. LOAD THE VIDEOS
-        views = ["ViewSide1", "ViewSide2", "ViewSide3", "ViewTop"]
-        all_views_frames = []
-        num_frames_in_video = 0
-        
-        for view_name in views:
-            video_path = glob.glob(os.path.join(case_folder, f"*{view_name}.avi"))[0]
-            cap = cv2.VideoCapture(video_path)
+            # 2. LOAD THE VIDEOS
+            views = ["ViewSide1", "ViewSide2", "ViewSide3", "ViewTop"]
+            all_views_frames = []
+            num_frames_in_video = 0
             
-            frames = []
-            while True: # Reads video exactly as rendered, preserving the temporal ramp-up/ramp-down sequence!
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                    
-                # CROP LOGIC
-                if self.crop_size is not None:
-                    h, w = frame.shape[:2]
-                    cx, cy = w // 2, h // 2
-                    half = self.crop_size // 2
-                    frame = frame[max(0, cy-half):min(h, cy+half), max(0, cx-half):min(w, cx+half)]
+            for view_name in views:
+                video_path = glob.glob(os.path.join(case_folder, f"*{view_name}.avi"))[0]
+                cap = cv2.VideoCapture(video_path)
                 
-                # --- MULTI-MODE PROCESSING ---
-                if self.image_mode == "rgb":
-                    frame_c = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame_resized = cv2.resize(frame_c, self.img_size, interpolation=cv2.INTER_AREA)
-                    frame_tensor = frame_resized.astype(np.float32) / 255.0
+                frames = []
+                while True: # Reads video exactly as rendered, preserving the temporal ramp-up/ramp-down sequence!
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                        
+                    # CROP LOGIC
+                    if self.crop_size is not None:
+                        h, w = frame.shape[:2]
+                        cx, cy = w // 2, h // 2
+                        half = self.crop_size // 2
+                        frame = frame[max(0, cy-half):min(h, cy+half), max(0, cx-half):min(w, cx+half)]
                     
-                elif self.image_mode == "grayscale":
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    frame_resized = cv2.resize(gray, self.img_size, interpolation=cv2.INTER_AREA)
-                    # Merge to 3 channels to keep ResNet architecture consistent
-                    frame_c = cv2.merge([frame_resized, frame_resized, frame_resized])
-                    frame_tensor = frame_c.astype(np.float32) / 255.0
+                    # --- MULTI-MODE PROCESSING ---
+                    if self.image_mode == "rgb":
+                        frame_c = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame_resized = cv2.resize(frame_c, self.img_size, interpolation=cv2.INTER_AREA)
+                        frame_tensor = frame_resized.astype(np.float32) / 255.0
+                        
+                    elif self.image_mode == "grayscale":
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        frame_resized = cv2.resize(gray, self.img_size, interpolation=cv2.INTER_AREA)
+                        # Merge to 3 channels to keep ResNet architecture consistent
+                        frame_c = cv2.merge([frame_resized, frame_resized, frame_resized])
+                        frame_tensor = frame_c.astype(np.float32) / 255.0
 
-                elif self.image_mode == "mask":
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-                    edges = cv2.Canny(blurred, 20, 100)
+                    elif self.image_mode == "mask":
+                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                        edges = cv2.Canny(blurred, 20, 100)
 
-                    kernel = np.ones((5, 5), np.uint8)
-                    dilated = cv2.dilate(edges, kernel, iterations=2)
-                    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        kernel = np.ones((5, 5), np.uint8)
+                        dilated = cv2.dilate(edges, kernel, iterations=2)
+                        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                    mask = np.zeros_like(gray)
-                    if contours:
-                        largest_contour = max(contours, key=cv2.contourArea)
-                        cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+                        mask = np.zeros_like(gray)
+                        if contours:
+                            largest_contour = max(contours, key=cv2.contourArea)
+                            cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
 
-                    mask = cv2.erode(mask, kernel, iterations=2)
+                        mask = cv2.erode(mask, kernel, iterations=2)
+                        
+                        # Ultimate cleanup pass to ensure a single solid silhouette with no holes or noise
+                        final_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        clean_mask = np.zeros_like(mask)
+                        if final_contours:
+                            true_largest = max(final_contours, key=cv2.contourArea)
+                            cv2.drawContours(clean_mask, [true_largest], -1, 255, thickness=cv2.FILLED)
+                        
+                        # KEY FIX: INTER_NEAREST prevents halo artifacts during downscaling
+                        mask_resized = cv2.resize(clean_mask, self.img_size, interpolation=cv2.INTER_NEAREST)
+                        mask_3c = cv2.merge([mask_resized, mask_resized, mask_resized])
+                        frame_tensor = mask_3c.astype(np.float32) / 255.0 
                     
-                    # Ultimate cleanup pass to ensure a single solid silhouette with no holes or noise
-                    final_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    clean_mask = np.zeros_like(mask)
-                    if final_contours:
-                        true_largest = max(final_contours, key=cv2.contourArea)
-                        cv2.drawContours(clean_mask, [true_largest], -1, 255, thickness=cv2.FILLED)
+                    # Channel-first format: [C, H, W]
+                    frame_tensor = np.transpose(frame_tensor, (2, 0, 1))
+                    frames.append(frame_tensor)
                     
-                    # KEY FIX: INTER_NEAREST prevents halo artifacts during downscaling
-                    mask_resized = cv2.resize(clean_mask, self.img_size, interpolation=cv2.INTER_NEAREST)
-                    mask_3c = cv2.merge([mask_resized, mask_resized, mask_resized])
-                    frame_tensor = mask_3c.astype(np.float32) / 255.0 
+                cap.release()
+                video_tensor = torch.tensor(np.array(frames)) # [Time, 3, 128, 128]
+                all_views_frames.append(video_tensor)
+                num_frames_in_video = len(frames)
                 
-                # Channel-first format: [C, H, W]
-                frame_tensor = np.transpose(frame_tensor, (2, 0, 1))
-                frames.append(frame_tensor)
-                
-            cap.release()
-            video_tensor = torch.tensor(np.array(frames)) # [Time, 3, 128, 128]
-            all_views_frames.append(video_tensor)
-            num_frames_in_video = len(frames)
+            videos = torch.stack(all_views_frames, dim=1) # [Time, Views, C, H, W]
             
-        videos = torch.stack(all_views_frames, dim=1) # [Time, Views, C, H, W]
-        
-        # 3. ALIGN TIME & STRICT NORMALIZATION
-        aligned_pressures = pressures_kpa[-num_frames_in_video:]
-        
-        # Convert kPa to Pa to accurately map the physical values
-        aligned_pressures_pa = aligned_pressures * 1000.0
-        
-        # Establishing a hard physical boundary to prevent mathematical collapse or negative vacuums
-        MIN_PRESSURE = 1.0 
-        aligned_pressures_pa = np.clip(aligned_pressures_pa, a_min=MIN_PRESSURE, a_max=100000.0)
-        
-        # Normalize to [0, 1] for stable neural network inputs (Assuming 100 kPa is max)
-        pressures_tensor = torch.tensor(aligned_pressures_pa / 100000.0) 
+            # 3. ALIGN TIME & STRICT NORMALIZATION
+            aligned_pressures = pressures_kpa[-num_frames_in_video:]
+            
+            # Convert kPa to Pa to accurately map the physical values
+            aligned_pressures_pa = aligned_pressures * 1000.0
+            
+            # Establishing a hard physical boundary to prevent mathematical collapse or negative vacuums
+            MIN_PRESSURE = 1.0 
+            aligned_pressures_pa = np.clip(aligned_pressures_pa, a_min=MIN_PRESSURE, a_max=100000.0)
+            
+            # Normalize to [0, 1] for stable neural network inputs (Assuming 100 kPa is max)
+            pressures_tensor = torch.tensor(aligned_pressures_pa / 100000.0) 
 
-        # Save to DISK before returning
-        result = {"video": videos, "pressures": pressures_tensor}
-        torch.save(result, cache_file_path)
+            # Save to DISK before returning
+            result = {"video": videos, "pressures": pressures_tensor}
+            torch.save(result, cache_file_path)
+
+        # ==========================================
+        # --- NEW: DYNAMIC TEMPORAL CHUNKING ---
+        # ==========================================
+        videos = result["video"]
+        pressures = result["pressures"]
+        total_frames = videos.shape[0]
         
-        return result
+        # If the video is longer than our target sequence length, slice a random chunk
+        if self.seq_len is not None and total_frames > self.seq_len:
+            start_idx = random.randint(0, total_frames - self.seq_len)
+            end_idx = start_idx + self.seq_len
+            
+            videos = videos[start_idx:end_idx]
+            pressures = pressures[start_idx:end_idx]
+            
+        return {"video": videos, "pressures": pressures}
 
 # ==========================================
 # --- HYSTERESIS PLOTTING TOOL ---
