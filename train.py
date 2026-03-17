@@ -65,7 +65,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/resnetGN_decoderConcat_125cases_clampfix_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/mixedDataset_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -73,14 +73,21 @@ def main():
     # 2. Initialize Dataset
     dataset = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
     
-    # --- AUTOMATIC 10% VALIDATION SPLIT ---
-    val_size = int(len(dataset) * 0.10)
-    train_size = len(dataset) - val_size
+    # Explicitly define Validation vs Training to protect the long videos
+    total_cases = len(dataset)
     
-    # Using a fixed seed for random_split ensures that if we resume training, 
-    # we don't accidentally leak validation cases into the training set!
-    generator = torch.Generator().manual_seed(42)
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
+    # Manually pick 12 specific indices from the original 2-second videos for validation set.
+    val_indices = [
+        79, 11, 124, 89, 7, 34, 61, 16, 24, 97, 109, 114, # original val set
+        5, 14, 23, 37, 48, 52, 66, 78, 81, 95, 101, 118, 122 # 13 additional 2-second cases
+    ]
+    
+    # Everything else including the 10s and 60s cases goes into Training
+    train_indices = [i for i in range(total_cases) if i not in val_indices]
+    
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+    print(f"Data Split -> Training Cases: {len(train_dataset)} | Validation Cases: {len(val_dataset)}")
     
     dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
