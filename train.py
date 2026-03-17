@@ -11,6 +11,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import gc # NEW: Added for aggressive memory cleanup
 
 # Import custom modules
 from multiview_dataset import SoftRobotDataset
@@ -37,6 +38,11 @@ def main():
     # 1. Configuration
     DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
     IMAGE_MODE = "mask" # Change to "rgb" to automatically enable LPIPS perceptual loss!
+    
+    # --- NEW: RESUME CAPABILITY ---
+    # Put the exact path to the folder that just crashed so we can pick up where we left off
+    RESUME_CHECKPOINT_PATH = ''#"runs/resnetGN_decoderConcat_125cases_clampfix_MASK_2026-03-12_01-10-53/last_checkpoint.pth"
+    START_EPOCH = 0
     
     BATCH_SIZE = 2 # or 4 if GPU memory allows
     FEATURE_DIM = 64
@@ -70,7 +76,11 @@ def main():
     # --- AUTOMATIC 10% VALIDATION SPLIT ---
     val_size = int(len(dataset) * 0.10)
     train_size = len(dataset) - val_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    
+    # Using a fixed seed for random_split ensures that if we resume training, 
+    # we don't accidentally leak validation cases into the training set!
+    generator = torch.Generator().manual_seed(42)
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
     
     dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -90,17 +100,41 @@ def main():
     # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
+    # --- NEW: RESUME LOGIC ---
+    best_val_loss = float('inf')
+    if os.path.exists(RESUME_CHECKPOINT_PATH):
+        print(f"=================================================")
+        print(f"RESUMING TRAINING FROM: {RESUME_CHECKPOINT_PATH}")
+        print(f"=================================================")
+        checkpoint = torch.load(RESUME_CHECKPOINT_PATH, map_location=device)
+        encoder.load_state_dict(checkpoint['encoder'])
+        dynamics.load_state_dict(checkpoint['dynamics'])
+        decoder.load_state_dict(checkpoint['decoder'])
+        
+        # If your checkpoint has the optimizer/epoch state, load it. If not, we just start at Epoch 203 manually.
+        if 'epoch' in checkpoint:
+            START_EPOCH = checkpoint['epoch']
+        else:
+            # We know it crashed right after finishing Epoch 203, so we start at 203
+            START_EPOCH = 203 
+            
+        if 'best_val_loss' in checkpoint:
+            best_val_loss = checkpoint['best_val_loss']
+        else:
+            best_val_loss = 0.061356 # Injecting the known best score
+            
+        # Fast-forward the learning rate scheduler to the correct epoch
+        for _ in range(START_EPOCH):
+            scheduler.step()
+
     # Define Loss Functions
     bce_loss_fn = nn.BCELoss() # Use BCE instead of L1 for sharper edges, Dice for better spatial overlap
 
     if IMAGE_MODE == "rgb":
         lpips_loss_fn = lpips.LPIPS(net='vgg').to(device) 
 
-    # Track the best validation loss
-    best_val_loss = float('inf')
-
     # 5. The Training Loop
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(START_EPOCH, NUM_EPOCHS):
         encoder.train()
         dynamics.train()
         decoder.train()
@@ -223,6 +257,15 @@ def main():
             
             epoch_loss += batch_sequence_loss.item()
             
+            # --- AGGRESSIVE MEMORY CLEANUP FOR MACS ---
+            # Deleting these heavy tensors and explicitly clearing the cache prevents fragmentation crashes
+            del videos, pressures, ray_origins, ray_dirs, target_rgb, rgb_pred, planes_next_pred, current_tri_planes, batch_sequence_loss, step_loss
+            if str(device) == "mps":
+                torch.mps.empty_cache()
+            elif str(device) == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+            
         # Step the learning rate down appropriately per epoch
         scheduler.step()
 
@@ -275,6 +318,14 @@ def main():
                     # Strictly feed prediction back into the engine
                     curr_planes = pred_planes
                     
+                # Clean up Validation Memory too
+                del vids_val, press_val, curr_planes, h_val
+                if str(device) == "mps":
+                    torch.mps.empty_cache()
+                elif str(device) == "cuda":
+                    torch.cuda.empty_cache()
+                gc.collect()
+                    
         avg_val_loss = val_loss / (len(val_loader) * (V_Time - 1))
         
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | TF Ratio: {tf_ratio:.2f} |\
@@ -288,30 +339,28 @@ def main():
         # ==========================================
         # --- CHECKPOINT SAVING ---
         # ==========================================
+        checkpoint_dict = {
+            'epoch': epoch + 1,
+            'best_val_loss': best_val_loss,
+            'train_indices': train_dataset.indices, # <--- SAVES EXACT TRAINING CASES
+            'val_indices': val_dataset.indices,     # <--- SAVES EXACT VALIDATION CASES
+            'encoder': encoder.state_dict(),
+            'dynamics': dynamics.state_dict(),
+            'decoder': decoder.state_dict(),
+        }
+        
         # Save the best overall model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save({
-                'encoder': encoder.state_dict(),
-                'dynamics': dynamics.state_dict(),
-                'decoder': decoder.state_dict(),
-            }, os.path.join(log_dir, "best_model.pth"))
+            torch.save(checkpoint_dict, os.path.join(log_dir, "best_model.pth"))
             print(f"*** New Best Model Saved (Val Loss: {best_val_loss:.6f}) ***")
 
         # Save milestone checkpoints every 50 epochs
         if (epoch + 1) % 50 == 0:
-            torch.save({
-                'encoder': encoder.state_dict(),
-                'dynamics': dynamics.state_dict(),
-                'decoder': decoder.state_dict(),
-            }, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
+            torch.save(checkpoint_dict, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
             
         # ALWAYS save the latest state so progress is never lost during sudden stops
-        torch.save({
-            'encoder': encoder.state_dict(),
-            'dynamics': dynamics.state_dict(),
-            'decoder': decoder.state_dict(),
-        }, os.path.join(log_dir, "last_checkpoint.pth"))
+        torch.save(checkpoint_dict, os.path.join(log_dir, "last_checkpoint.pth"))
 
     writer.close()
 
