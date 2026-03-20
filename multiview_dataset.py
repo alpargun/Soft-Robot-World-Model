@@ -26,11 +26,26 @@ class SoftRobotDataset(Dataset):
         self.image_mode = image_mode.lower()
         self.seq_len = seq_len # seq_len=60 to enforce uniform tensor sizes for PyTorch batches
         
-        folders = glob.glob(os.path.join(run_folder, "Case_*"))
-        self.case_folders = sorted(folders, key=lambda x: int(re.search(r'Case_(\d+)', os.path.basename(x)).group(1)))
+        # --- NEW: Get all subdirectories without filtering ---
+        all_subdirs = [os.path.join(run_folder, d) for d in os.listdir(run_folder) if os.path.isdir(os.path.join(run_folder, d))]
+        
+        # --- SMART SORT LOGIC ---
+        # Guarantees Case_1 to Case_125 stay strictly at Indices 0 to 124.
+        # New folders are safely appended to the end of the list.
+        def smart_sort(folder_path):
+            folder_name = os.path.basename(folder_path)
+            match = re.search(r'Case_(\d+)', folder_name)
+            if match:
+                return (0, int(match.group(1))) # Sorts original cases numerically
+            else:
+                return (1, folder_name)         # Sorts new folders alphabetically at the end
+                
+        self.case_folders = sorted(all_subdirs, key=smart_sort)
         
         if len(self.case_folders) == 0:
-            print(f"Warning: No Case folders found in {run_folder}")
+            print(f"Warning: No folders found in {run_folder}")
+        else:
+            print(f"Successfully discovered {len(self.case_folders)} total sequence folders.")
             
     def __len__(self):
         return len(self.case_folders)
