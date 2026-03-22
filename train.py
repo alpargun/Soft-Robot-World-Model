@@ -65,28 +65,45 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/mixedDataset_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/barcode_fix_mixedDataset_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
 
     # 2. Initialize Dataset
-    dataset = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE)
+    # --- THE BARCODE KILLER FIX ---
+    # Training Base: Sliced to 45 frames. Every epoch, the start frame randomly shifts. The barcode is destroyed.
+    train_base = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, seq_len=45)
     
-    # Explicitly define Validation vs Training to protect the long videos
-    total_cases = len(dataset)
+    # Validation Base: seq_len=None. It will always return the FULL original sequence to strictly evaluate compounding errors.
+    val_base = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, seq_len=None)
     
-    # Manually pick 12 specific indices from the original 2-second videos for validation set.
-    val_indices = [
-        79, 11, 124, 89, 7, 34, 61, 16, 24, 97, 109, 114, # original val set
-        5, 14, 23, 37, 48, 52, 66, 78, 81, 95, 101, 118, 122 # 13 additional 2-second cases
-    ]
+    total_cases = len(train_base)
     
-    # Everything else including the 10s and 60s cases goes into Training
+    # ==========================================
+    # --- AUTOMATED VALIDATION SPLIT ---
+    # ==========================================
+    # Dynamically count the total number of discrete bending cases (folders starting with 'Case_')
+    NUM_BENDING_CASES = len([f for f in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, f)) and f.startswith("Case_")])
+    VAL_PERCENTAGE = 0.15
+    
+    # Set seed for reproducible splits across runs. If it crashes, it will reload the exact same split.
+    random.seed(42)
+    
+    # We ONLY sample validation cases from the dynamically counted discrete bends.
+    # We want the long PE and Creep videos to stay STRICTLY in the training set
+    all_bending_indices = list(range(NUM_BENDING_CASES))
+    num_val_cases = int(NUM_BENDING_CASES * VAL_PERCENTAGE)
+    
+    # Randomly pick indices from the bending cases
+    val_indices = random.sample(all_bending_indices, num_val_cases)
+    print(f"Validation Cases: {len(val_indices)}" f"| Validation Indices: {sorted(val_indices)}")
+    
+    # Training indices: Everything that isn't a validation case (includes the remaining bends + all PE/Creep videos)
     train_indices = [i for i in range(total_cases) if i not in val_indices]
     
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
+    train_dataset = Subset(train_base, train_indices)
+    val_dataset = Subset(val_base, val_indices)
     print(f"Data Split -> Training Cases: {len(train_dataset)} | Validation Cases: {len(val_dataset)}")
     
     dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
@@ -119,16 +136,8 @@ def main():
         decoder.load_state_dict(checkpoint['decoder'])
         
         # If your checkpoint has the optimizer/epoch state, load it. If not, we just start at Epoch 203 manually.
-        if 'epoch' in checkpoint:
-            START_EPOCH = checkpoint['epoch']
-        else:
-            # We know it crashed right after finishing Epoch 203, so we start at 203
-            START_EPOCH = 203 
-            
-        if 'best_val_loss' in checkpoint:
-            best_val_loss = checkpoint['best_val_loss']
-        else:
-            best_val_loss = 0.061356 # Injecting the known best score
+        START_EPOCH = checkpoint['epoch'] 
+        best_val_loss = checkpoint['best_val_loss']
             
         # Fast-forward the learning rate scheduler to the correct epoch
         for _ in range(START_EPOCH):
@@ -198,8 +207,15 @@ def main():
                 # Slightly reduced lambda as max entropy is ~0.69 (ln 2), which scales differently than uniform mean
                 lambda_sparse = 0.005
                 
-                # Weight them equally, adding the sparsity penalty
-                step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
+                # --- NEW: ACTION-CONDITIONED LOSS WEIGHTING ---
+                # Find the maximum pressure magnitude in this batch (returns a value between ~0.0 and 1.0)
+                pressure_magnitude = torch.mean(torch.max(action_t, dim=1)[0])
+                # Scale the loss dynamically: 1.0x for resting/small moves, up to 4.0x for extreme 100k bends
+                loss_multiplier = 1.0 + (3.0 * pressure_magnitude)
+                
+                # Weight them equally, adding the sparsity penalty, then scale by the action multiplier
+                base_step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
+                step_loss = base_step_loss * loss_multiplier
                 
                 # 3. Perceptual LPIPS Loss (Requires 2D image patches)
                 if IMAGE_MODE == "rgb":
@@ -318,6 +334,7 @@ def main():
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
                     # === USE THE HYBRID BCE+DICE LOSS FOR VALIDATION ===
+                    # Note: We do NOT scale the validation loss. We want pure, unweighted geometry error here.
                     loss_bce_val = bce_loss_fn(rgb_p, target)
                     loss_dice_val = dice_loss(rgb_p, target)
                     val_loss += (loss_bce_val + loss_dice_val).item()
