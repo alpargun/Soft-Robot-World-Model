@@ -80,14 +80,26 @@ def main():
     
     total_cases = len(train_base)
     
-    # (Note: Because of our `smart_sort` in the Dataset class, indices 0-124 are mathematically 
-    # guaranteed to be Case_0 through Case_124. These manual indices are 100% safe to use!)
-    val_indices = [
-        79, 11, 124, 89, 7, 34, 61, 16, 24, 97, 109, 114, 
-        5, 14, 23, 37, 48, 52, 66, 78, 81, 95, 101, 118, 122 
-    ]
+    # ==========================================
+    # --- AUTOMATED VALIDATION SPLIT ---
+    # ==========================================
+    # Dynamically count the total number of discrete bending cases (folders starting with 'Case_')
+    NUM_BENDING_CASES = len([f for f in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, f)) and f.startswith("Case_")])
+    VAL_PERCENTAGE = 0.15
     
-    # Everything else goes into Training
+    # Set seed for reproducible splits across runs. If it crashes, it will reload the exact same split.
+    random.seed(42)
+    
+    # We ONLY sample validation cases from the dynamically counted discrete bends.
+    # We want the long PE and Creep videos to stay STRICTLY in the training set
+    all_bending_indices = list(range(NUM_BENDING_CASES))
+    num_val_cases = int(NUM_BENDING_CASES * VAL_PERCENTAGE)
+    
+    # Randomly pick indices from the bending cases
+    val_indices = random.sample(all_bending_indices, num_val_cases)
+    print(f"Validation Cases: {len(val_indices)}" f"| Validation Indices: {sorted(val_indices)}")
+    
+    # Training indices: Everything that isn't a validation case (includes the remaining bends + all PE/Creep videos)
     train_indices = [i for i in range(total_cases) if i not in val_indices]
     
     train_dataset = Subset(train_base, train_indices)
@@ -195,8 +207,15 @@ def main():
                 # Slightly reduced lambda as max entropy is ~0.69 (ln 2), which scales differently than uniform mean
                 lambda_sparse = 0.005
                 
-                # Weight them equally, adding the sparsity penalty
-                step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
+                # --- NEW: ACTION-CONDITIONED LOSS WEIGHTING ---
+                # Find the maximum pressure magnitude in this batch (returns a value between ~0.0 and 1.0)
+                pressure_magnitude = torch.mean(torch.max(action_t, dim=1)[0])
+                # Scale the loss dynamically: 1.0x for resting/small moves, up to 4.0x for extreme 100k bends
+                loss_multiplier = 1.0 + (3.0 * pressure_magnitude)
+                
+                # Weight them equally, adding the sparsity penalty, then scale by the action multiplier
+                base_step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
+                step_loss = base_step_loss * loss_multiplier
                 
                 # 3. Perceptual LPIPS Loss (Requires 2D image patches)
                 if IMAGE_MODE == "rgb":
@@ -315,6 +334,7 @@ def main():
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
                     # === USE THE HYBRID BCE+DICE LOSS FOR VALIDATION ===
+                    # Note: We do NOT scale the validation loss. We want pure, unweighted geometry error here.
                     loss_bce_val = bce_loss_fn(rgb_p, target)
                     loss_dice_val = dice_loss(rgb_p, target)
                     val_loss += (loss_bce_val + loss_dice_val).item()
