@@ -35,9 +35,17 @@ def dice_loss(pred, target, smooth=1e-5):
     return 1.0 - dice_coeff
 
 def main():
+    
     # 1. Configuration
     DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
     IMAGE_MODE = "mask" # Change to "rgb" to automatically enable LPIPS perceptual loss!
+
+    # Initialize TensorBoard Writer and Log Directory
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir = f"runs/128features_actionWeightedLoss_mixedDataset_{IMAGE_MODE.upper()}_{timestamp}"
+    writer = SummaryWriter(log_dir=log_dir)
+    print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
+    print(f"Checkpoints will be saved to: {log_dir}")
     
     # --- NEW: RESUME CAPABILITY ---
     # Put the exact path to the folder that just crashed so we can pick up where we left off
@@ -45,7 +53,7 @@ def main():
     START_EPOCH = 0
     
     BATCH_SIZE = 2 # or 4 if GPU memory allows
-    FEATURE_DIM = 64
+    FEATURE_DIM = 128
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 1000
     RAYS_PER_STEP = 1600 # Number of rays to sample per time step for loss calculation
@@ -62,13 +70,6 @@ def main():
         print("No GPU available. Training on CPU.")
 
     print(f"Initializing World Model Training on: {device} | Mode: {IMAGE_MODE.upper()}")
-
-    # Initialize TensorBoard Writer and Log Directory
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/barcode_fix_mixedDataset_{IMAGE_MODE.upper()}_{timestamp}"
-    writer = SummaryWriter(log_dir=log_dir)
-    print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
-    print(f"Checkpoints will be saved to: {log_dir}")
 
     # 2. Initialize Dataset
     # --- THE BARCODE KILLER FIX ---
