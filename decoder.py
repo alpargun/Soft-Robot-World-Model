@@ -3,19 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TriPlaneDecoder(nn.Module):
-    def __init__(self, feature_dim=64, hidden_dim=64, image_mode="mask"):
+    def __init__(self, feature_dim=64, image_mode="mask"):
         super().__init__()
         
         self.image_mode = image_mode
         # Toggle output channels based on the mode
         out_channels = 1 if image_mode == "mask" else 3
         
-        # CRITICAL FIX: The input is now feature_dim * 3 because we concatenate the 3 planes
+        hidden_dim = feature_dim * 3 # Increased hidden dimension for better expressiveness with high-res planes
+
+        # Input is feature_dim * 3 because we concatenate the 3 planes
         self.mlp = nn.Sequential(
             nn.Linear(feature_dim * 3, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.SiLU(), # Swapped ReLU for SiLU to ensure smooth, continuous 3D boundaries
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True)
+            nn.SiLU()
         )
         
         self.color_head = nn.Sequential(
@@ -63,8 +65,7 @@ class TriPlaneDecoder(nn.Module):
         feat_xz = self.sample_plane(tri_planes['xz'], coords_xz)
         feat_yz = self.sample_plane(tri_planes['yz'], coords_yz)
         
-        # 3. Aggregate features (CRITICAL FIX: Concatenation)
-        # Prevents hollow T-shapes by preserving distinct plane data, and prevents autoregressive drift.
+        # 3. Aggregate features (Concatenation)
         fused_features = torch.cat([feat_xy, feat_xz, feat_yz], dim=-1)
         
         # 4. Predict Color and Density using the MLP
