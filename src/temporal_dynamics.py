@@ -11,8 +11,6 @@ class ConvGRUCell(nn.Module):
         # Candidate hidden state (h~)
         self.conv_can = nn.Conv2d(input_dim + hidden_dim, hidden_dim, kernel_size, padding=padding)
         
-        self.ln = nn.GroupNorm(num_groups=4, num_channels=hidden_dim)
-
     def forward(self, x, h_prev):
         combined = torch.cat([x, h_prev], dim=1)
         gates = torch.sigmoid(self.conv_gates(combined))
@@ -24,7 +22,7 @@ class ConvGRUCell(nn.Module):
         # GRU update: h_t = (1-z) * h_{t-1} + z * h~
         h_new = (1 - update_gate) * h_prev + update_gate * h_candidate
         
-        return self.ln(h_new)
+        return h_new
 
 class TriPlaneDynamics(nn.Module):
     def __init__(self, feature_dim=32, action_dim=3):
@@ -59,17 +57,27 @@ class TriPlaneDynamics(nn.Module):
         """
         B, C, H, W = tri_planes_t['xy'].shape
         
-        # --- Decoupled FiLM Modulation ---
+        # --- Decoupled Bounded Residual FiLM ---
         action_params = self.film_generator(action_t) # [B, 6*C]
-        
-        # Chunk into 6 distinct parameter blocks
         params = action_params.chunk(6, dim=1)
         
-        # Map specific gammas and betas to their respective planes and reshape for spatial broadcasting
+        # We limit the maximum shift per time-step to 20% (0.2)
+        # By adding 1.0 to gamma, the default behavior is the Identity (no change)
+        bound = 0.2
+        
         film_params = {
-            'xy': (params[0].view(B, C, 1, 1), params[1].view(B, C, 1, 1)),
-            'xz': (params[2].view(B, C, 1, 1), params[3].view(B, C, 1, 1)),
-            'yz': (params[4].view(B, C, 1, 1), params[5].view(B, C, 1, 1))
+            'xy': (
+                1.0 + bound * torch.tanh(params[0].view(B, C, 1, 1)), # Gamma (Scale)
+                bound * torch.tanh(params[1].view(B, C, 1, 1))        # Beta (Shift)
+            ),
+            'xz': (
+                1.0 + bound * torch.tanh(params[2].view(B, C, 1, 1)), 
+                bound * torch.tanh(params[3].view(B, C, 1, 1))
+            ),
+            'yz': (
+                1.0 + bound * torch.tanh(params[4].view(B, C, 1, 1)), 
+                bound * torch.tanh(params[5].view(B, C, 1, 1))
+            )
         }
         
         # Initialize hidden states if not provided (i.e., at the first time step)
