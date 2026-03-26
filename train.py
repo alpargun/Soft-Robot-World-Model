@@ -42,7 +42,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/128features_actionWeightedLoss_mixedDataset_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/125cases_frameStride_decoderExpand_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -53,10 +53,13 @@ def main():
     START_EPOCH = 0
     
     BATCH_SIZE = 2 # or 4 if GPU memory allows
-    FEATURE_DIM = 128
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 1000
-    RAYS_PER_STEP = 1600 # Number of rays to sample per time step for loss calculation
+
+    FRAME_STRIDE = 2 # Skip every other frame to force learning of dynamics, not just memorization.
+    SEQUENCE_LENGTH = 23
+    FEATURE_DIM = 64
+    RAYS_PER_STEP = 512 # Number of rays to sample per time step for loss calculation
     
     # Check for GPU availability
     if torch.cuda.is_available():
@@ -74,10 +77,16 @@ def main():
     # 2. Initialize Dataset
     # --- THE BARCODE KILLER FIX ---
     # Training Base: Sliced to 45 frames. Every epoch, the start frame randomly shifts. The barcode is destroyed.
-    train_base = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, seq_len=45)
+    train_base = SoftRobotDataset(
+        DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
+        seq_len=SEQUENCE_LENGTH, frame_stride=FRAME_STRIDE
+    )
     
     # Validation Base: seq_len=None. It will always return the FULL original sequence to strictly evaluate compounding errors.
-    val_base = SoftRobotDataset(DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, seq_len=None)
+    val_base = SoftRobotDataset(
+        DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
+        seq_len=None, frame_stride=FRAME_STRIDE
+    )
     
     total_cases = len(train_base)
     
