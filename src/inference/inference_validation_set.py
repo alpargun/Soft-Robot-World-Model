@@ -6,16 +6,16 @@ import cv2
 import numpy as np
 from torch.utils.data import DataLoader, Subset
 
-from multiview_dataset import SoftRobotDataset
-from encoder_resnet_gn import ResNetGNTriPlaneEncoder
-from temporal_dynamics import TriPlaneDynamics
-from decoder import TriPlaneDecoder
-from volumetric_ray_marcher import VolumetricRayMarcher
-from visualization_helper import get_full_image_rays
+from src.multiview_dataset import SoftRobotDataset
+from src.encoder_resnet_gn import ResNetGNTriPlaneEncoder
+from src.temporal_dynamics import TriPlaneDynamics
+from src.decoder import TriPlaneDecoder
+from src.volumetric_ray_marcher import VolumetricRayMarcher
+from src.visualization_helper import get_full_image_rays
 
 def main():
     DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    CHECKPOINT_PATH = "runs/mixedDataset_MASK_2026-03-17_02-32-38/last_checkpoint.pth"
+    CHECKPOINT_PATH = "runs/actionWeightedLoss_mixedDataset_MASK_2026-03-22_13-50-49/best_model.pth"
     VIDEOS_DIR = "generated_vids/bulk_validation"
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     
@@ -40,14 +40,9 @@ def main():
     decoder.load_state_dict(checkpoint['decoder'])
     for model in [encoder, dynamics, decoder]: model.eval()
 
-    # --- AUTOMATIC VALIDATION INDEX EXTRACTION ---
-    if 'val_indices' in checkpoint:
-        VAL_INDICES = checkpoint['val_indices']
-        print(f"SUCCESS: Automatically loaded {len(VAL_INDICES)} validation indices from checkpoint!")
-    else:
-        print("WARNING: 'val_indices' key not found in this checkpoint.")
-        print("Falling back to the known manual split for this run...")
-        VAL_INDICES = [11, 41, 113, 85, 93, 107, 72, 74, 18, 59, 105, 31, 5, 14, 23, 37, 48, 52, 66, 78, 81, 95, 101, 118, 122]
+    # Find validation indices from the checkpoint.
+    VAL_INDICES = checkpoint['val_indices']
+    print(f"SUCCESS: Automatically loaded {len(VAL_INDICES)} validation indices from checkpoint!")
 
     dataset = SoftRobotDataset(run_folder=DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, seq_len=None)
 

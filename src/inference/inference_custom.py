@@ -7,12 +7,12 @@ import numpy as np
 from datetime import datetime
 from torch.utils.data import DataLoader, Subset
 
-from multiview_dataset import SoftRobotDataset
-from encoder_resnet_gn import ResNetGNTriPlaneEncoder
-from temporal_dynamics import TriPlaneDynamics
-from decoder import TriPlaneDecoder
-from volumetric_ray_marcher import VolumetricRayMarcher
-from visualization_helper import get_full_image_rays
+from src.multiview_dataset import SoftRobotDataset
+from src.encoder_resnet_gn import ResNetGNTriPlaneEncoder
+from src.temporal_dynamics import TriPlaneDynamics
+from src.decoder import TriPlaneDecoder
+from src.volumetric_ray_marcher import VolumetricRayMarcher
+from src.visualization_helper import get_full_image_rays
 
 def generate_synthetic_pressures(time_steps, device):
     """
@@ -31,7 +31,7 @@ def generate_synthetic_pressures(time_steps, device):
 
 def main():
     DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    CHECKPOINT_PATH = "runs/mixedDataset_MASK_2026-03-17_02-32-38/last_checkpoint.pth"
+    CHECKPOINT_PATH = "runs/125cases_64features_actionWeightedLoss_MASK_2026-03-24_17-08-49/last_checkpoint.pth"
     TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     VIDEOS_DIR = "generated_vids/true_custom"
