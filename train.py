@@ -42,7 +42,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/majorDebug_125cases_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/boundedResFiLM_majorDebug_125cases_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -57,7 +57,8 @@ def main():
     SEQUENCE_LENGTH = 23
     FEATURE_DIM = 64
     RAYS_PER_STEP = 512 # Number of rays to sample per time step for loss calculation
-    
+    TF_UNTIL = 200 # Epoch until which teacher forcing is used
+
     # Check for GPU availability
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -124,7 +125,7 @@ def main():
     all_params = list(encoder.parameters()) + list(dynamics.parameters()) + list(decoder.parameters())
     
     # Added weight decay to prevent FiLM Shift (beta) parameters from growing too large and ignoring inputs
-    optimizer = optim.Adam(all_params, lr=LEARNING_RATE, weight_decay=1e-5)
+    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-5) # AdamW decouples weight decay from grad update
     
     # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
@@ -160,8 +161,8 @@ def main():
         
         epoch_loss = 0.0
         
-        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 200, forcing pure autoregression
-        tf_ratio = max(0.0, 1.0 - (epoch / 200.0))
+        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch TF_UNTIL, forcing pure autoregression
+        tf_ratio = max(0.0, 1.0 - (epoch / TF_UNTIL))
         
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
