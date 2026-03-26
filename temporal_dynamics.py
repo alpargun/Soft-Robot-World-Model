@@ -1,11 +1,7 @@
 import torch
 import torch.nn as nn
 
-class ResidualConvGRUCell(nn.Module):
-    """
-    An upgraded ConvGRU with a residual path to help gradients flow 
-    through long 60-frame sequences without vanishing.
-    """
+class ConvGRUCell(nn.Module):
     def __init__(self, input_dim, hidden_dim, kernel_size=3):
         super().__init__()
         padding = kernel_size // 2
@@ -15,7 +11,6 @@ class ResidualConvGRUCell(nn.Module):
         # Candidate hidden state (h~)
         self.conv_can = nn.Conv2d(input_dim + hidden_dim, hidden_dim, kernel_size, padding=padding)
         
-        # LayerNorm helps stabilize recurrent training on Apple Silicon/MPS
         self.ln = nn.GroupNorm(num_groups=4, num_channels=hidden_dim)
 
     def forward(self, x, h_prev):
@@ -26,7 +21,7 @@ class ResidualConvGRUCell(nn.Module):
         combined_can = torch.cat([x, reset_gate * h_prev], dim=1)
         h_candidate = torch.tanh(self.conv_can(combined_can))
         
-        # Standard GRU update equation: h_t = (1-z) * h_{t-1} + z * h~
+        # GRU update: h_t = (1-z) * h_{t-1} + z * h~
         h_new = (1 - update_gate) * h_prev + update_gate * h_candidate
         
         return self.ln(h_new)
@@ -45,8 +40,8 @@ class TriPlaneDynamics(nn.Module):
         )
         
         # 2. Shared Physics Engine
-        # We process the modulated planes through a Residual ConvGRU
-        self.dynamics_rnn = ResidualConvGRUCell(
+        # We process the modulated planes through a ConvGRU
+        self.dynamics_rnn = ConvGRUCell(
             input_dim=feature_dim, 
             hidden_dim=feature_dim
         )
@@ -81,7 +76,7 @@ class TriPlaneDynamics(nn.Module):
         for plane_key in ['xy', 'xz', 'yz']:
             plane_features = tri_planes_t[plane_key]
             
-            # STEP 1: Apply FiLM (This forces the AI to listen to the pressure)
+            # STEP 1: Apply FiLM to focus on action conditioning
             # If pressures change, the entire feature map is mathematically forced to shift
             modulated_input = (gamma * plane_features) + beta
             
