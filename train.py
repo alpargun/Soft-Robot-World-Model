@@ -3,7 +3,6 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 from datetime import datetime
 import random
-import lpips
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,27 +17,28 @@ from src.multiview_dataset import SoftRobotDataset
 from src.encoder import TriPlaneEncoder
 from src.temporal_dynamics import TriPlaneDynamics
 from src.decoder import TriPlaneDecoder
-from src.volumetric_ray_marcher import VolumetricRayMarcher
-from src.orthographic_ray_generator import sample_orthographic_rays
-from src.visualization_helper import get_full_image_rays
+from src.renderer import VolumetricRayMarcher, sample_orthographic_rays, get_full_image_rays
 
 
-def dice_loss(pred, target, smooth=1e-5):
-    # Flatten tensors to calculate spatial overlap
-    pred_flat = pred.contiguous().view(-1)
-    target_flat = target.contiguous().view(-1)
+def dice_loss_per_batch(pred, target, smooth=1e-5):
+    # Preserve the batch dimension [B], flatten the spatial/channel dimensions [-1]
+    B = pred.shape[0]
+    pred_flat = pred.contiguous().view(B, -1)
+    target_flat = target.contiguous().view(B, -1)
     
-    intersection = (pred_flat * target_flat).sum()
-    # Dice formula: 2 * Intersection / (Pred_Area + Target_Area)
-    dice_coeff = (2.0 * intersection + smooth) / (pred_flat.sum() + target_flat.sum() + smooth)
+    # Sum across the spatial dimensions (dim=1), maintaining shape [B]
+    intersection = (pred_flat * target_flat).sum(dim=1)
     
-    return 1.0 - dice_coeff
+    # Dice formula calculates a distinct coefficient for each item in the batch
+    dice_coeff = (2.0 * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
+    
+    return 1.0 - dice_coeff # Returns a tensor of shape [B]
 
 def main():
     
     # 1. Configuration
     DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    IMAGE_MODE = "mask" # Change to "rgb" to automatically enable LPIPS perceptual loss!
+    IMAGE_MODE = "mask"
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -72,14 +72,12 @@ def main():
     print(f"Initializing World Model Training on: {device} | Mode: {IMAGE_MODE.upper()}")
 
     # 2. Initialize Dataset
-    # --- THE BARCODE KILLER FIX ---
-    # Training Base: Sliced to 45 frames. Every epoch, the start frame randomly shifts. The barcode is destroyed.
     train_base = SoftRobotDataset(
         DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
         seq_len=SEQUENCE_LENGTH, frame_stride=FRAME_STRIDE
     )
     
-    # Validation Base: seq_len=None. It will always return the FULL original sequence to strictly evaluate compounding errors.
+    # Validation Base: seq_len=None. Returns the full original sequences
     val_base = SoftRobotDataset(
         DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
         seq_len=None, frame_stride=FRAME_STRIDE
@@ -151,10 +149,8 @@ def main():
             scheduler.step()
 
     # Define Loss Functions
-    bce_loss_fn = nn.BCELoss() # Use BCE instead of L1 for sharper edges, Dice for better spatial overlap
-
-    if IMAGE_MODE == "rgb":
-        lpips_loss_fn = lpips.LPIPS(net='vgg').to(device) 
+    # Initialize with reduction='none' so it outputs per-pixel losses
+    bce_loss_fn = nn.BCELoss(reduction='none') # Use BCE instead of L1 for sharper edges
 
     # 5. The Training Loop
     for epoch in range(start_epoch, NUM_EPOCHS):
@@ -182,9 +178,15 @@ def main():
             # Establish the initial state
             current_tri_planes = encoder(videos[:, 0])
             
-            for t in range(Time - 1):
-                # Clamp the pressure to ensure a strict floor of 1.0 and a physical ceiling of 100000.0
-                action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
+            for t in range(Time - 1):                
+                # Action jittering: Adds small random noise to the pressures to prevent overfitting to exact values 
+                # and encourage learning of smooth dynamics. 
+                base_action = pressures[:, t]
+                # Add random noise between -0.025 and +0.025 (2.5% pressure fluctuation)
+                action_noise = (torch.rand_like(base_action) - 0.5) * 0.05
+                # Clamp the jittered action so we never feed the model impossible physics (like negative pressure)
+                action_t = torch.clamp(base_action + action_noise, min=0.00001, max=1.0)
+                                
                 frames_next_true = videos[:, t+1] 
                 
                 # Predict the next 3D state
@@ -195,63 +197,51 @@ def main():
                     frames_next_true, num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                 rgb_pred = ray_marcher.render_rays(decoder, planes_next_pred, ray_origins, ray_dirs)
                 
-                # 1. Combined BCE and Dice Loss for expanding geometric masks
-                loss_bce = bce_loss_fn(rgb_pred, target_rgb)
-                loss_dice = dice_loss(rgb_pred, target_rgb)
+                # 1. Combined BCE and Dice Loss (Shape: [B])
+                raw_bce = bce_loss_fn(rgb_pred, target_rgb)
+                # Average the BCE loss across spatial dimensions, keeping the batch dimension
+                loss_bce = raw_bce.view(B, -1).mean(dim=1) 
                 
-                # 2. 3D Sparsity Loss (Entropy-based for crisp boundaries)
-                # Sample 1024 random 3D coordinates in the bounding box [-1, 1]^3
+                loss_dice = dice_loss_per_batch(rgb_pred, target_rgb)
+                
+                # 2. 3D Sparsity Loss (Shape: [B])
                 random_points_3d = (torch.rand(B, 1024, 3, device=device) * 2.0) - 1.0
                 random_probs, _ = decoder(planes_next_pred, random_points_3d)
                 
-                # Calculate binary entropy. Epsilon (1e-6) prevents log(0) NaN explosions.
                 eps = 1e-6
                 entropy = -random_probs * torch.log(random_probs + eps) -\
                     (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
-                sparsity_loss = torch.mean(entropy)
                 
-                # Slightly reduced lambda as max entropy is ~0.69 (ln 2), which scales differently than uniform mean
+                # Average entropy per batch item
+                sparsity_loss = entropy.view(B, -1).mean(dim=1) 
                 lambda_sparse = 0.005
                 
-                # --- NEW: ACTION-CONDITIONED LOSS WEIGHTING ---
-                # Find the maximum pressure magnitude in this batch (returns a value between ~0.0 and 1.0)
-                pressure_magnitude = torch.mean(torch.max(action_t, dim=1)[0])
-                # Scale the loss dynamically: 1.0x for resting/small moves, up to 4.0x for extreme 100k bends
+                # ==========================================
+                # --- PER-SAMPLE ACTION WEIGHTING ---
+                # ==========================================
+                # Calculate the max pressure for each specific video in the batch. Shape: [B]
+                pressure_magnitude = torch.max(action_t, dim=1)[0]
+                
+                # Each batch item gets its own exact multiplier. Shape: [B]
                 loss_multiplier = 1.0 + (3.0 * pressure_magnitude)
                 
-                # Weight them equally, adding the sparsity penalty, then scale by the action multiplier
+                # Sum the isolated losses, apply the specific multiplier, then reduce to a scalar
                 base_step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
-                step_loss = base_step_loss * loss_multiplier
+                weighted_step_loss = base_step_loss * loss_multiplier 
                 
-                # 3. Perceptual LPIPS Loss (Requires 2D image patches)
-                if IMAGE_MODE == "rgb":
-                    # Calculate the dimension of the square patch (e.g., 400 rays = 20x20 patch)
-                    rays_per_view = RAYS_PER_STEP // Views
-                    patch_dim = int(rays_per_view ** 0.5)
-                    
-                    # Reshape from [Batch, 1600, 3] -> [Batch * 4 Views, 3 Channels, 20 Height, 20 Width]
-                    # This creates 4 separate mini-images for LPIPS to analyze
-                    rgb_pred_patch = rgb_pred.view(B * Views, patch_dim, patch_dim, 3).permute(0, 3, 1, 2)
-                    target_rgb_patch = target_rgb.view(B * Views, patch_dim, patch_dim, 3).permute(0, 3, 1, 2)
-                    
-                    # LPIPS expects images in range [-1, 1], our RGB is currently [0, 1]
-                    pred_lpips = rgb_pred_patch * 2.0 - 1.0
-                    target_lpips = target_rgb_patch * 2.0 - 1.0
-                    
-                    # Add the perceptual loss to the L1 loss (usually weighted slightly less)
-                    lpips_val = lpips_loss_fn(pred_lpips, target_lpips).mean()
-                    step_loss += (0.1 * lpips_val)
-
+                # Collapse to a single scalar for .backward()
+                step_loss = weighted_step_loss.mean()
+                
                 batch_sequence_loss += step_loss
                 
-                # === SCHEDULED SAMPLING LOGIC ===
+                # === SCHEDULED SAMPLING ===
                 # Roll a virtual die to decide if we help the AI or force it to rely on itself
                 if random.random() < tf_ratio:
                     # Teacher Forcing: Feed it the perfect ground truth for the next step
                     current_tri_planes = encoder(frames_next_true)
                 else:
                     # Autoregressive: Force it to use its own noisy prediction
-                    current_tri_planes = {k: v.detach() for k, v in planes_next_pred.items()}
+                    current_tri_planes = {k: v for k, v in planes_next_pred.items()}
                 
                 # ---------------------------------------------------------
                 # VISUALIZATION BLOCK (All 4 Views -> TensorBoard)
@@ -339,11 +329,17 @@ def main():
                         vids_val[:, t+1], num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
-                    # === USE THE HYBRID BCE+DICE LOSS FOR VALIDATION ===
-                    # Validation loss is not scaled by actions. We calculate unweighted geometry error.
-                    loss_bce_val = bce_loss_fn(rgb_p, target)
-                    loss_dice_val = dice_loss(rgb_p, target)
-                    val_loss += (loss_bce_val + loss_dice_val).item()
+                    # === Hybrid BCE+Dice Loss for Validation ===
+                    # 1. Calculate per-batch BCE (matching training logic)
+                    raw_bce_val = bce_loss_fn(rgb_p, target)
+                    loss_bce_val = raw_bce_val.view(batch["video"].shape[0], -1).mean(dim=1) 
+                    
+                    # 2. Calculate per-batch Dice
+                    loss_dice_val = dice_loss_per_batch(rgb_p, target)
+                    
+                    # 3. Sum them, mean across the batch, and extract the single scalar for tracking
+                    val_step_loss = (loss_bce_val + loss_dice_val).mean()
+                    val_loss += val_step_loss.item()
                     
                     # Strictly feed prediction back into the engine
                     curr_planes = pred_planes

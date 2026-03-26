@@ -31,20 +31,24 @@ class TriPlaneDynamics(nn.Module):
         super().__init__()
         self.feature_dim = feature_dim
         
-        # 1. Action-to-FiLM Generator
-        # We generate a Scale (gamma) and Shift (beta) for every feature channel
+        # 1. Action-to-FiLM Generator (DECOUPLED)
+        # Generate 6 sets of parameters: [gamma_xy, beta_xy, gamma_xz, beta_xz, gamma_yz, beta_yz]
         self.film_generator = nn.Sequential(
-            nn.Linear(action_dim, feature_dim * 2),
+            nn.Linear(action_dim, feature_dim * 4), # Widened hidden layer to support larger output
             nn.LeakyReLU(0.2),
-            nn.Linear(feature_dim * 2, feature_dim * 2) # Outputs [gamma, beta]
+            nn.Linear(feature_dim * 4, feature_dim * 6) # Outputs 6 * C
         )
         
         # 2. Shared Physics Engine
-        # We process the modulated planes through a ConvGRU
+        # The ConvGRU still shares weights across planes to maintain translation invariance
         self.dynamics_rnn = ConvGRUCell(
             input_dim=feature_dim, 
             hidden_dim=feature_dim
         )
+
+        # 3. Dynamic Initial State Generator
+        # Projects the visual resting frame into a physical resting memory state
+        self.h0_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
 
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
         """
@@ -55,19 +59,25 @@ class TriPlaneDynamics(nn.Module):
         """
         B, C, H, W = tri_planes_t['xy'].shape
         
-        # --- FiLM Modulation ---
-        # Generate gamma (scale) and beta (shift) from pressures
-        # Equation: Output = gamma * Features + beta
-        action_params = self.film_generator(action_t) # [B, 2*C]
-        gamma, beta = action_params.chunk(2, dim=1)
+        # --- Decoupled FiLM Modulation ---
+        action_params = self.film_generator(action_t) # [B, 6*C]
         
-        # Reshape for broadcasting across spatial H, W
-        gamma = gamma.view(B, C, 1, 1)
-        beta = beta.view(B, C, 1, 1)
+        # Chunk into 6 distinct parameter blocks
+        params = action_params.chunk(6, dim=1)
         
-        # Initialize hidden states if necessary
+        # Map specific gammas and betas to their respective planes and reshape for spatial broadcasting
+        film_params = {
+            'xy': (params[0].view(B, C, 1, 1), params[1].view(B, C, 1, 1)),
+            'xz': (params[2].view(B, C, 1, 1), params[3].view(B, C, 1, 1)),
+            'yz': (params[4].view(B, C, 1, 1), params[5].view(B, C, 1, 1))
+        }
+        
+        # Initialize hidden states if not provided (i.e., at the first time step)
         if hidden_states_prev is None:
-            hidden_states_prev = {k: torch.zeros_like(v) for k, v in tri_planes_t.items()}
+            # Use tanh to keep the memory state bounded [-1, 1] like the GRU expects
+            hidden_states_prev = {
+                k: torch.tanh(self.h0_proj(v)) for k, v in tri_planes_t.items()
+            }
             
         tri_planes_next = {}
         hidden_states_new = {}
@@ -76,12 +86,13 @@ class TriPlaneDynamics(nn.Module):
         for plane_key in ['xy', 'xz', 'yz']:
             plane_features = tri_planes_t[plane_key]
             
-            # STEP 1: Apply FiLM to focus on action conditioning
-            # If pressures change, the entire feature map is mathematically forced to shift
+            # Retrieve the specific affine shifts for THIS orthogonal plane
+            gamma, beta = film_params[plane_key]
+            
+            # STEP 1: Apply Directional FiLM
             modulated_input = (gamma * plane_features) + beta
             
             # STEP 2: Step the Physics RNN
-            # The hidden state captures the path (hysteresis)
             h_new = self.dynamics_rnn(modulated_input, hidden_states_prev[plane_key])
             
             tri_planes_next[plane_key] = h_new
