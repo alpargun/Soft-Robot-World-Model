@@ -7,12 +7,11 @@ import cv2
 import torch
 import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from matplotlib import animation
+from torch.utils.data import Dataset
+
 
 class SoftRobotDataset(Dataset):
-    def __init__(self, run_folder, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=60):
+    def __init__(self, run_folder, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=60, frame_stride=2):
         """
         Args:
             run_folder (str): Path to the main 'Run_YYYY-MM-DD_...' directory.
@@ -25,20 +24,23 @@ class SoftRobotDataset(Dataset):
         self.crop_size = crop_size
         self.image_mode = image_mode.lower()
         self.seq_len = seq_len # seq_len=60 to enforce uniform tensor sizes for PyTorch batches
+        self.frame_stride = frame_stride # Temporal stride to skip frames and force learn dynamics, not memorize
         
-        # --- NEW: Get all subdirectories without filtering ---
-        all_subdirs = [os.path.join(run_folder, d) for d in os.listdir(run_folder) if os.path.isdir(os.path.join(run_folder, d))]
+        # Find only the folders that start with "Case_" to avoid PE and creep videos
+        all_subdirs = [
+            os.path.join(run_folder, d) for d in os.listdir(run_folder) 
+            if os.path.isdir(os.path.join(run_folder, d)) and d.startswith("Case_")
+        ]
         
-        # --- SMART SORT LOGIC ---
         # Guarantees Case_1 to Case_125 stay strictly at Indices 0 to 124.
-        # New folders are safely appended to the end of the list.
+        # New folders are appended to the end of the list.
         def smart_sort(folder_path):
             folder_name = os.path.basename(folder_path)
             match = re.search(r'Case_(\d+)', folder_name)
             if match:
                 return (0, int(match.group(1))) # Sorts original cases numerically
             else:
-                return (1, folder_name)         # Sorts new folders alphabetically at the end
+                return (1, folder_name)  # Sorts new folders alphabetically at the end
                 
         self.case_folders = sorted(all_subdirs, key=smart_sort)
         
@@ -155,103 +157,27 @@ class SoftRobotDataset(Dataset):
             torch.save(result, cache_file_path)
 
         # ==========================================
-        # --- NEW: DYNAMIC TEMPORAL CHUNKING ---
+        # --- TEMPORAL SUBSAMPLING ---
         # ==========================================
-        videos = result["video"]
-        pressures = result["pressures"]
-        total_frames = videos.shape[0]
+        videos = result["video"]          # Shape: [Time, Views, C, H, W]
+        pressures = result["pressures"]   # Shape: [Time, 3]
         
-        # If the video is longer than our target sequence length, slice a random chunk
-        if self.seq_len is not None and total_frames > self.seq_len:
-            start_idx = random.randint(0, total_frames - self.seq_len)
+        # 1. Apply the Temporal Stride
+        # Skips redundant frames to force the network to learn translation, not memorization.
+        videos = videos[::self.frame_stride]
+        pressures = pressures[::self.frame_stride]
+        
+        total_subsampled_frames = videos.shape[0]
+        
+        # 2. Dynamic Temporal Chunking
+        # self.seq_len represents the number of STRIDED frames (23 frames ~ 1.5 seconds)
+        if self.seq_len is not None and total_subsampled_frames > self.seq_len:
+            # Leave enough room to slice `self.seq_len` frames
+            max_start = total_subsampled_frames - self.seq_len
+            start_idx = random.randint(0, max_start)
             end_idx = start_idx + self.seq_len
             
             videos = videos[start_idx:end_idx]
             pressures = pressures[start_idx:end_idx]
             
         return {"video": videos, "pressures": pressures}
-
-# ==========================================
-# --- HYSTERESIS PLOTTING TOOL ---
-# ==========================================
-def plot_hysteresis_curve(dataset, sample_index=0):
-    print(f"Loading node data for sample {sample_index} to calculate hysteresis...")
-    case_folder = dataset.case_folders[sample_index]
-    
-    node_csv_path = glob.glob(os.path.join(case_folder, "*_NodeData.csv"))[0]
-    press_csv_path = glob.glob(os.path.join(case_folder, "*_PressureProfile.csv"))[0]
-    
-    df_nodes = pd.read_csv(node_csv_path)
-    df_press = pd.read_csv(press_csv_path)
-    
-    df_nodes.columns = df_nodes.columns.str.strip()
-    df_press.columns = df_press.columns.str.strip()
-    
-    df_nodes['TotalDef_mm'] = np.sqrt(df_nodes['DefX(m)']**2 + df_nodes['DefY(m)']**2 + df_nodes['DefZ(m)']**2) * 1000.0
-    max_def_per_time = df_nodes.groupby('Time(s)')['TotalDef_mm'].max().reset_index()
-    
-    df_press['Time(s)'] = df_press['Time(s)'].round(4)
-    max_def_per_time['Time(s)'] = max_def_per_time['Time(s)'].round(4)
-    
-    merged_df = pd.merge(max_def_per_time, df_press, on='Time(s)', how='inner')
-    merged_df['Active_Pressure_kPa'] = merged_df[['P1(kPa)', 'P2(kPa)', 'P3(kPa)']].max(axis=1)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(merged_df['Active_Pressure_kPa'], merged_df['TotalDef_mm'], marker='o', linestyle='-', color='b', markersize=4)
-    
-    plt.title(f"Hysteresis Curve (Case {sample_index+1})", fontsize=16)
-    plt.xlabel("Applied Pressure (kPa)", fontsize=14)
-    plt.ylabel("Max Total Deformation (mm)", fontsize=14)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    plt.show()
-
-# ==========================================
-# --- DEBUG: DYNAMIC MULTI-VIEW VISUALIZER ---
-# ==========================================
-def visualize_dynamic_multiview(dataset, sample_index=0):
-    print(f"Loading sample {sample_index} for visualization...")
-    sample = dataset[sample_index]
-    
-    video_tensor = sample["video"]             
-    pressures_tensor = sample["pressures"]     
-    
-    video_np = video_tensor.permute(0, 1, 3, 4, 2).numpy() 
-    pressures_np = (pressures_tensor * 100000.0).int().numpy()   
-    
-    fig, axes = plt.subplots(2, 2, figsize=(8, 8))
-    axes = axes.flatten()
-    view_names = ["Side 1 (+X)", "Side 2 (+Y)", "Side 3 (-X)", "Top (+Z)"]
-    
-    p_init = pressures_np[0]
-    title = fig.suptitle(f"Time: 0.00s | P1: {p_init[0]} | P2: {p_init[1]} | P3: {p_init[2]} Pa", fontsize=14)
-    
-    ims = []
-    for i, ax in enumerate(axes):
-        ax.axis('off')
-        ax.set_title(view_names[i])
-        im = ax.imshow(video_np[0, i])
-        ims.append(im)
-    
-    def update(frame_idx):
-        for i, im in enumerate(ims):
-            im.set_array(video_np[frame_idx, i])
-            
-        p_curr = pressures_np[frame_idx]
-        current_time = (frame_idx + 1) * (2.0 / 60)
-        title.set_text(f"Time: {current_time:.2f}s | P1: {p_curr[0]} | P2: {p_curr[1]} | P3: {p_curr[2]} Pa")
-        return ims + [title]
-    
-    anim = animation.FuncAnimation(fig, update, frames=len(video_np), interval=33, repeat=True)
-    plt.tight_layout()
-    plt.show()
-
-if __name__ == "__main__":
-    DATA_DIR = r"/Users/alp/Desktop/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
-    
-    # Toggle "mask", "rgb", or "grayscale" directly here!
-    dataset = SoftRobotDataset(run_folder=DATA_DIR, img_size=(128, 128), crop_size=600, image_mode="mask")
-    
-    # Run the debug visualizer and explicitly call the hysteresis plot function
-    plot_hysteresis_curve(dataset, sample_index=0)
-    visualize_dynamic_multiview(dataset, sample_index=0)
