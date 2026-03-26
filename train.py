@@ -42,7 +42,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/125cases_frameStride_decoderExpand_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/majorDebug_125cases_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -242,30 +242,6 @@ def main():
                 else:
                     # Autoregressive: Force it to use its own noisy prediction
                     current_tri_planes = {k: v for k, v in planes_next_pred.items()}
-                
-                # ---------------------------------------------------------
-                # VISUALIZATION BLOCK (All 4 Views -> TensorBoard)
-                # ---------------------------------------------------------
-                # Log both the middle frame (peak motion) and the last frame (max compounding error/hallucination)
-                if (epoch + 1) % 10 == 0 and batch_idx == 0 and (t == (Time // 2) or t == (Time - 2)):
-                    
-                    # Group them cleanly in TensorBoard
-                    stage_name = "Middle" if t == (Time // 2) else "Last"
-                    
-                    with torch.no_grad():
-                        for v in range(Views):
-                            real_frame = frames_next_true[0, v].detach().cpu()
-                            full_ray_origins, full_ray_dirs = get_full_image_rays(H, W, view_idx=v, device=device)
-                            full_ray_origins = full_ray_origins.unsqueeze(0)
-                            full_ray_dirs = full_ray_dirs.unsqueeze(0)
-                            
-                            single_plane_pred = {key: planes_next_pred[key][0:1] for key in planes_next_pred} 
-                            full_rgb_pred = ray_marcher.render_rays(
-                                decoder, single_plane_pred, full_ray_origins, full_ray_dirs)
-                            pred_frame = full_rgb_pred.view(H, W, 3).permute(2, 0, 1).detach().cpu()
-                            
-                            comparison_grid = torch.cat((real_frame, pred_frame), dim=2)
-                            writer.add_image(f'Comparison_{stage_name}/Side_{v+1}', comparison_grid, epoch + 1)
 
             batch_sequence_loss = batch_sequence_loss / (Time - 1)
             batch_sequence_loss.backward()
@@ -308,12 +284,12 @@ def main():
         val_loss = 0.0
         
         with torch.no_grad():
-            for batch in val_loader:
+            for val_batch_idx, batch in enumerate(val_loader):
                 vids_val = batch["video"].to(device)
                 press_val = batch["pressures"].to(device)
-                _, V_Time, _, _, _, _ = vids_val.shape
+                B_val, V_Time, Views, C, H, W = vids_val.shape
                 
-                # Validation is ALWAYS 100% Autoregressive (No Teacher Forcing) to test true physics learning
+                # Validation is ALWAYS 100% Autoregressive (No Teacher Forcing)
                 curr_planes = encoder(vids_val[:, 0])
                 h_val = None
                 
@@ -332,14 +308,37 @@ def main():
                     # === Hybrid BCE+Dice Loss for Validation ===
                     # 1. Calculate per-batch BCE (matching training logic)
                     raw_bce_val = bce_loss_fn(rgb_p, target)
-                    loss_bce_val = raw_bce_val.view(batch["video"].shape[0], -1).mean(dim=1) 
-                    
+                    loss_bce_val = raw_bce_val.view(B_val, -1).mean(dim=1)
                     # 2. Calculate per-batch Dice
                     loss_dice_val = dice_loss_per_batch(rgb_p, target)
                     
-                    # 3. Sum them, mean across the batch, and extract the single scalar for tracking
                     val_step_loss = (loss_bce_val + loss_dice_val).mean()
                     val_loss += val_step_loss.item()
+                    
+                    # ---------------------------------------------------------
+                    # VALIDATION VISUALIZATION BLOCK (100% Autoregressive)
+                    # ---------------------------------------------------------
+                    # Log every 10 epochs, ONLY on the first validation batch
+                    if (epoch + 1) % 10 == 0 and val_batch_idx == 0 and (t == (V_Time // 2) or t == (V_Time - 2)):
+                        
+                        stage_name = "Val_Middle" if t == (V_Time // 2) else "Val_Last"
+                        
+                        for v in range(Views):
+                            real_frame = vids_val[0, t+1, v].detach().cpu()
+                            full_ray_origins, full_ray_dirs = get_full_image_rays(H, W, view_idx=v, device=device)
+                            full_ray_origins = full_ray_origins.unsqueeze(0)
+                            full_ray_dirs = full_ray_dirs.unsqueeze(0)
+                            
+                            # Render the full image for the first video in the batch [0:1]
+                            single_plane_pred = {key: pred_planes[key][0:1] for key in pred_planes} 
+                            full_rgb_pred = ray_marcher.render_rays(
+                                decoder, single_plane_pred, full_ray_origins, full_ray_dirs)
+                            
+                            pred_frame = full_rgb_pred.view(H, W, 3).permute(2, 0, 1).detach().cpu()
+                            
+                            comparison_grid = torch.cat((real_frame, pred_frame), dim=2)
+                            # Tag clearly as Validation in TensorBoard
+                            writer.add_image(f'Validation_Autoregressive_{stage_name}/Side_{v+1}', comparison_grid, epoch + 1)
                     
                     # Strictly feed prediction back into the engine
                     curr_planes = pred_planes
