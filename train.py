@@ -1,5 +1,5 @@
 import os
-# Tell PyTorch to use the CPU for any missing Apple GPU operations
+# Use the CPU for any missing Apple GPU operations
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 from datetime import datetime
 import random
@@ -11,16 +11,16 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import gc # NEW: Added for aggressive memory cleanup
+import gc
 
 # Import custom modules
-from multiview_dataset import SoftRobotDataset
-from encoder_resnet_gn import ResNetGNTriPlaneEncoder
-from temporal_dynamics import TriPlaneDynamics
-from decoder import TriPlaneDecoder
-from volumetric_ray_marcher import VolumetricRayMarcher
-from orthographic_ray_generator import sample_orthographic_rays
-from visualization_helper import get_full_image_rays
+from src.multiview_dataset import SoftRobotDataset
+from src.encoder import TriPlaneEncoder
+from src.temporal_dynamics import TriPlaneDynamics
+from src.decoder import TriPlaneDecoder
+from src.volumetric_ray_marcher import VolumetricRayMarcher
+from src.orthographic_ray_generator import sample_orthographic_rays
+from src.visualization_helper import get_full_image_rays
 
 
 def dice_loss(pred, target, smooth=1e-5):
@@ -46,11 +46,8 @@ def main():
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
-    
-    # --- NEW: RESUME CAPABILITY ---
-    # Put the exact path to the folder that just crashed so we can pick up where we left off
-    RESUME_CHECKPOINT_PATH = ''#"runs/resnetGN_decoderConcat_125cases_clampfix_MASK_2026-03-12_01-10-53/last_checkpoint.pth"
-    START_EPOCH = 0
+      
+    RESUME_CHECKPOINT_PATH = '' # If left empty, training starts from scratch.
     
     BATCH_SIZE = 2 # or 4 if GPU memory allows
     LEARNING_RATE = 1e-4
@@ -120,7 +117,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
     # 3. Initialize Model Components
-    encoder = ResNetGNTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    encoder = TriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
@@ -134,8 +131,9 @@ def main():
     # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
-    # --- NEW: RESUME LOGIC ---
+    # --- RESUME CHECKPOINT ---
     best_val_loss = float('inf')
+    start_epoch = 0
     if os.path.exists(RESUME_CHECKPOINT_PATH):
         print(f"=================================================")
         print(f"RESUMING TRAINING FROM: {RESUME_CHECKPOINT_PATH}")
@@ -145,12 +143,11 @@ def main():
         dynamics.load_state_dict(checkpoint['dynamics'])
         decoder.load_state_dict(checkpoint['decoder'])
         
-        # If your checkpoint has the optimizer/epoch state, load it. If not, we just start at Epoch 203 manually.
-        START_EPOCH = checkpoint['epoch'] 
+        start_epoch = checkpoint['epoch'] 
         best_val_loss = checkpoint['best_val_loss']
             
         # Fast-forward the learning rate scheduler to the correct epoch
-        for _ in range(START_EPOCH):
+        for _ in range(start_epoch):
             scheduler.step()
 
     # Define Loss Functions
@@ -160,15 +157,14 @@ def main():
         lpips_loss_fn = lpips.LPIPS(net='vgg').to(device) 
 
     # 5. The Training Loop
-    for epoch in range(START_EPOCH, NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):
         encoder.train()
         dynamics.train()
         decoder.train()
         
         epoch_loss = 0.0
         
-        # --- FASTER TF DECAY ---
-        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 200 to force autoregressive learning sooner
+        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch 200, forcing pure autoregression
         tf_ratio = max(0.0, 1.0 - (epoch / 200.0))
         
         # Wraps the dataloader to show a progress bar for the current epoch
@@ -284,7 +280,7 @@ def main():
             batch_sequence_loss = batch_sequence_loss / (Time - 1)
             batch_sequence_loss.backward()
             
-            # CRITICAL: Gradient clipping prevents FiLM from blowing up during pure autoregression
+            # Gradient clipping prevents FiLM from blowing up during pure autoregression
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
             
@@ -332,7 +328,7 @@ def main():
                 h_val = None
                 
                 for t in range(V_Time - 1):
-                    # ADD THE EXACT SAME CLAMP TO VALIDATION
+                    # Apply the same clamping to validation pressures
                     action_val_clamped = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
                     
                     # Feed the clamped action into the dynamics engine
@@ -344,7 +340,7 @@ def main():
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
                     # === USE THE HYBRID BCE+DICE LOSS FOR VALIDATION ===
-                    # Note: We do NOT scale the validation loss. We want pure, unweighted geometry error here.
+                    # Validation loss is not scaled by actions. We calculate unweighted geometry error.
                     loss_bce_val = bce_loss_fn(rgb_p, target)
                     loss_dice_val = dice_loss(rgb_p, target)
                     val_loss += (loss_bce_val + loss_dice_val).item()
@@ -367,7 +363,7 @@ def main():
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
         writer.add_scalar('Training/TF_Ratio', tf_ratio, epoch + 1)
-        # Optional: track LR visually
+        # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
         # ==========================================

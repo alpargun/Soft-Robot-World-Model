@@ -8,7 +8,7 @@ from datetime import datetime
 from torch.utils.data import DataLoader, Subset
 
 from src.multiview_dataset import SoftRobotDataset
-from src.encoder_resnet_gn import ResNetGNTriPlaneEncoder
+from src.encoder import TriPlaneEncoder
 from src.temporal_dynamics import TriPlaneDynamics
 from src.decoder import TriPlaneDecoder
 from src.volumetric_ray_marcher import VolumetricRayMarcher
@@ -47,7 +47,7 @@ def main():
     if torch.cuda.is_available(): device = torch.device("cuda")
 
     # Load Models
-    encoder = ResNetGNTriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
+    encoder = TriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
     dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 
-class ResNetGNTriPlaneEncoder(nn.Module):
+class TriPlaneEncoder(nn.Module):
     def __init__(self, feature_dim=64, image_mode="mask"):
         super().__init__()
         
