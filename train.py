@@ -128,15 +128,14 @@ def main():
 
     # 3. Initialize Model Components
     encoder = TriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
-    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
+    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=16).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
 
     # 4. Optimizer Setup
     all_params = list(encoder.parameters()) + list(dynamics.parameters()) + list(decoder.parameters())
     
-    # Added weight decay to prevent FiLM Shift (beta) parameters from growing too large and ignoring inputs
-    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-5) # AdamW decouples weight decay from grad update
+    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-6) # AdamW decouples weight decay from grad update
     
     # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
@@ -202,7 +201,17 @@ def main():
                 frames_next_true = videos[:, t+1] 
                 
                 # Predict the next 3D state
-                planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
+                # ==========================================
+                # --- VISUAL DROPOUT ---
+                # ==========================================
+                # 15% of the time, we zero out the visual features.
+                # This breaks the "video retrieval" cheat code and forces the physics 
+                # engine to rely solely on the pressure inputs to calculate the next state.
+                if random.random() < 0.15:
+                    dropped_planes = {k: torch.zeros_like(v) for k, v in current_tri_planes.items()}
+                    planes_next_pred, hidden_state = dynamics(dropped_planes, action_t, hidden_state)
+                else:
+                    planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
                 
                 # Render the current frame
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
@@ -258,7 +267,7 @@ def main():
             batch_sequence_loss = batch_sequence_loss / (Time - 1)
             batch_sequence_loss.backward()
             
-            # Gradient clipping prevents FiLM from blowing up during pure autoregression
+            # Gradient clipping prevents the network from blowing up during pure autoregression
             torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
             optimizer.step()
             
