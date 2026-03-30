@@ -25,27 +25,28 @@ class ConvGRUCell(nn.Module):
         return h_new
 
 class TriPlaneDynamics(nn.Module):
-    def __init__(self, feature_dim=32, action_dim=3):
+    def __init__(self, feature_dim=128, action_dim=3, action_embed_dim=16):
         super().__init__()
         self.feature_dim = feature_dim
+        self.action_dim = action_dim
+        self.action_embed_dim = action_embed_dim
         
-        # 1. Action-to-FiLM Generator (DECOUPLED)
-        # Generate 6 sets of parameters: [gamma_xy, beta_xy, gamma_xz, beta_xz, gamma_yz, beta_yz]
-        self.film_generator = nn.Sequential(
-            nn.Linear(action_dim, feature_dim * 4), # Widened hidden layer to support larger output
+        # 1. Action Embedding 
+        # Processes the 3 raw pressure values into a richer feature representation
+        self.action_mlp = nn.Sequential(
+            nn.Linear(action_dim, self.action_embed_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(feature_dim * 4, feature_dim * 6) # Outputs 6 * C
+            nn.Linear(self.action_embed_dim, self.action_embed_dim)
         )
         
-        # 2. Shared Physics Engine
-        # The ConvGRU still shares weights across planes to maintain translation invariance
+        # 2. Hard-Coupled Physics Engine
+        # The ConvGRU is forced to look at the geometry and the action simultaneously
         self.dynamics_rnn = ConvGRUCell(
-            input_dim=feature_dim, 
+            input_dim=feature_dim + self.action_embed_dim, 
             hidden_dim=feature_dim
         )
 
         # 3. Dynamic Initial State Generator
-        # Projects the visual resting frame into a physical resting memory state
         self.h0_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
 
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
@@ -57,32 +58,14 @@ class TriPlaneDynamics(nn.Module):
         """
         B, C, H, W = tri_planes_t['xy'].shape
         
-        # --- Decoupled Bounded Residual FiLM ---
-        action_params = self.film_generator(action_t) # [B, 6*C]
-        params = action_params.chunk(6, dim=1)
+        # --- Spatial Action Concatenation ---
+        # 1. Embed the raw pressures
+        act_embed = self.action_mlp(action_t) # [B, action_embed_dim]
         
-        # We limit the maximum shift per time-step to 20% (0.2)
-        # By adding 1.0 to gamma, the default behavior is the Identity (no change)
-        bound = 0.2
+        # 2. Expand the 1D embedding into a 2D spatial grid [B, action_embed_dim, H, W]
+        act_spatial = act_embed.view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         
-        film_params = {
-            'xy': (
-                1.0 + bound * torch.tanh(params[0].view(B, C, 1, 1)), # Gamma (Scale)
-                bound * torch.tanh(params[1].view(B, C, 1, 1))        # Beta (Shift)
-            ),
-            'xz': (
-                1.0 + bound * torch.tanh(params[2].view(B, C, 1, 1)), 
-                bound * torch.tanh(params[3].view(B, C, 1, 1))
-            ),
-            'yz': (
-                1.0 + bound * torch.tanh(params[4].view(B, C, 1, 1)), 
-                bound * torch.tanh(params[5].view(B, C, 1, 1))
-            )
-        }
-        
-        # Initialize hidden states if not provided (i.e., at the first time step)
         if hidden_states_prev is None:
-            # Use tanh to keep the memory state bounded [-1, 1] like the GRU expects
             hidden_states_prev = {
                 k: torch.tanh(self.h0_proj(v)) for k, v in tri_planes_t.items()
             }
@@ -90,18 +73,16 @@ class TriPlaneDynamics(nn.Module):
         tri_planes_next = {}
         hidden_states_new = {}
         
-        # Process planes
         for plane_key in ['xy', 'xz', 'yz']:
             plane_features = tri_planes_t[plane_key]
             
-            # Retrieve the specific affine shifts for THIS orthogonal plane
-            gamma, beta = film_params[plane_key]
-            
-            # STEP 1: Apply Directional FiLM
-            modulated_input = (gamma * plane_features) + beta
+            # STEP 1: The Hard-Coupling Glue
+            # We explicitly stack the geometry and the pressure together along the channel dimension.
+            # Shape becomes [B, C + action_embed_dim, H, W]
+            coupled_input = torch.cat([plane_features, act_spatial], dim=1)
             
             # STEP 2: Step the Physics RNN
-            h_new = self.dynamics_rnn(modulated_input, hidden_states_prev[plane_key])
+            h_new = self.dynamics_rnn(coupled_input, hidden_states_prev[plane_key])
             
             tri_planes_next[plane_key] = h_new
             hidden_states_new[plane_key] = h_new
