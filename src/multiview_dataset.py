@@ -11,50 +11,67 @@ from torch.utils.data import Dataset
 
 
 class SoftRobotDataset(Dataset):
-    def __init__(self, run_folder, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=60, frame_stride=2):
+    def __init__(self, run_folders, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=24, frame_stride=2):
         """
         Args:
-            run_folder (str): Path to the main 'Run_YYYY-MM-DD_...' directory.
+            run_folders (list or str): A single path OR a list of paths to your dataset directories.
             img_size (tuple): Target (Height, Width) for the neural network.
             crop_size (int): Center crop square dimension BEFORE resizing.
             image_mode (str): "mask" (silhouette), "rgb" (color), or "grayscale".
         """
-        self.run_folder = run_folder
+        # Ensure it's a list even if a single string is passed
+        if isinstance(run_folders, str):
+            self.run_folders = [run_folders]
+        else:
+            self.run_folders = run_folders
+            
         self.img_size = img_size
         self.crop_size = crop_size
         self.image_mode = image_mode.lower()
-        self.seq_len = seq_len # seq_len=60 to enforce uniform tensor sizes for PyTorch batches
-        self.frame_stride = frame_stride # Temporal stride to skip frames and force learn dynamics, not memorize
+        self.seq_len = seq_len 
+        self.frame_stride = frame_stride # Temporal stride to skip frames
         
-        # Find only the folders that start with "Case_" to avoid PE and creep videos
-        all_subdirs = [
-            os.path.join(run_folder, d) for d in os.listdir(run_folder) 
-            if os.path.isdir(os.path.join(run_folder, d)) and d.startswith("Case_")
-        ]
+        self.case_folders = []
         
-        # Guarantees Case_1 to Case_125 stay strictly at Indices 0 to 124.
-        # New folders are appended to the end of the list.
-        def smart_sort(folder_path):
-            folder_name = os.path.basename(folder_path)
-            match = re.search(r'Case_(\d+)', folder_name)
-            if match:
-                return (0, int(match.group(1))) # Sorts original cases numerically
-            else:
-                return (1, folder_name)  # Sorts new folders alphabetically at the end
-                
-        self.case_folders = sorted(all_subdirs, key=smart_sort)
+        # Iterate through every master folder provided
+        for folder in self.run_folders:
+            # Find valid subdirectories in this specific folder
+            subdirs = [
+                os.path.join(folder, d) for d in os.listdir(folder) 
+                if os.path.isdir(os.path.join(folder, d)) and 
+                   (d.startswith("Case_") or "Staircase" in d)
+            ]
+            
+            # Sort them locally so the order is deterministic
+            def smart_sort(folder_path):
+                folder_name = os.path.basename(folder_path)
+                match = re.search(r'Case_(\d+)', folder_name)
+                if match:
+                    return (0, int(match.group(1))) 
+                elif "Staircase" in folder_name:
+                    return (1, folder_name)  
+                else:
+                    return (2, folder_name)  
+                    
+            sorted_subdirs = sorted(subdirs, key=smart_sort)
+            
+            # Append the absolute paths to our master list
+            self.case_folders.extend(sorted_subdirs)
         
         if len(self.case_folders) == 0:
-            print(f"Warning: No folders found in {run_folder}")
+            print(f"Warning: No valid folders found in the provided paths.")
         else:
-            print(f"Successfully discovered {len(self.case_folders)} total sequence folders.")
+            print(f"Successfully discovered {len(self.case_folders)} total sequence folders across {len(self.run_folders)} directories.")
             
     def __len__(self):
         return len(self.case_folders)
 
     def __getitem__(self, idx):
         case_folder = self.case_folders[idx]
-        cache_file_path = os.path.join(case_folder, f"processed_tensor_cache_{self.image_mode}.pt")
+
+        # Embed the specific parameters into the filename
+        cache_name = f"processed_cache_{self.image_mode}_{self.img_size[0]}x{self.img_size[1]}_crop{self.crop_size}.pt"
+        cache_file_path = os.path.join(case_folder, cache_name)
         
         # Skip OpenCV processing if it is in the cache (Load directly from disk)
         if os.path.exists(cache_file_path):
@@ -169,12 +186,17 @@ class SoftRobotDataset(Dataset):
         
         total_subsampled_frames = videos.shape[0]
         
-        # 2. Dynamic Temporal Chunking
+        # 2. Dynamic Temporal Chunking & Cold Start Anchoring
         # self.seq_len represents the number of STRIDED frames (23 frames ~ 1.5 seconds)
         if self.seq_len is not None and total_subsampled_frames > self.seq_len:
-            # Leave enough room to slice `self.seq_len` frames
             max_start = total_subsampled_frames - self.seq_len
-            start_idx = random.randint(0, max_start)
+            
+            # Cold Start Anchoring: Force 30% of the training sequences to start exactly at Frame 0.
+            if random.random() < 0.30:
+                start_idx = 0
+            else:
+                start_idx = random.randint(0, max_start)
+                
             end_idx = start_idx + self.seq_len
             
             videos = videos[start_idx:end_idx]

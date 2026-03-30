@@ -37,12 +37,18 @@ def dice_loss_per_batch(pred, target, smooth=1e-5):
 def main():
     
     # 1. Configuration
-    DATA_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis/Run_2026-03-01_23-47-27"
+
+    # Pass all your separate data directories as a list
+    DATA_DIRS = [
+        r"/Users/alp/SoftRobot_Dataset_Hysteresis/125_cases",  # 25k step size
+        r"/Users/alp/SoftRobot_Dataset_Hysteresis/216_cases",  # 20k step size
+        r"/Users/alp/SoftRobot_Dataset_Hysteresis/Staircase_creep"      # The 60-second creep data
+    ]
     IMAGE_MODE = "mask"
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/boundedResFiLM_majorDebug_125cases_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/combinedDataset_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -54,8 +60,8 @@ def main():
     NUM_EPOCHS = 1000
 
     FRAME_STRIDE = 2 # Skip every other frame to force learning of dynamics, not just memorization.
-    SEQUENCE_LENGTH = 23
-    FEATURE_DIM = 64
+    SEQUENCE_LENGTH = 24
+    FEATURE_DIM = 128
     RAYS_PER_STEP = 512 # Number of rays to sample per time step for loss calculation
     TF_UNTIL = 200 # Epoch until which teacher forcing is used
 
@@ -74,39 +80,44 @@ def main():
 
     # 2. Initialize Dataset
     train_base = SoftRobotDataset(
-        DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
+        run_folders=DATA_DIRS, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
         seq_len=SEQUENCE_LENGTH, frame_stride=FRAME_STRIDE
     )
     
     # Validation Base: seq_len=None. Returns the full original sequences
     val_base = SoftRobotDataset(
-        DATA_DIR, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
+        run_folders=DATA_DIRS, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
         seq_len=None, frame_stride=FRAME_STRIDE
     )
     
-    total_cases = len(train_base)
+    # ==========================================
+    # --- Validation Split ---
+    # ==========================================
+    # Randomly select 15% of the pure bending cases for validation
+    all_bending_indices = []
+    special_indices = []
     
-    # ==========================================
-    # --- AUTOMATED VALIDATION SPLIT ---
-    # ==========================================
-    # Dynamically count the total number of discrete bending cases (folders starting with 'Case_')
-    NUM_BENDING_CASES = len([f for f in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, f)) and f.startswith("Case_")])
+    for idx, folder_path in enumerate(train_base.case_folders):
+        folder_name = os.path.basename(folder_path)
+        if folder_name.startswith("Case_"):
+            all_bending_indices.append(idx)
+        else:
+            # Captures Staircase, PE, or any other non-standard folders
+            special_indices.append(idx)
+            
     VAL_PERCENTAGE = 0.15
     
-    # Set seed for reproducible splits across runs. If it crashes, it will reload the exact same split.
+    # Set seed for reproducible splits across runs.
     random.seed(42)
     
-    # We ONLY sample validation cases from the dynamically counted discrete bends.
-    # We want the long PE and Creep videos to stay STRICTLY in the training set
-    all_bending_indices = list(range(NUM_BENDING_CASES))
-    num_val_cases = int(NUM_BENDING_CASES * VAL_PERCENTAGE)
+    num_val_cases = int(len(all_bending_indices) * VAL_PERCENTAGE)
     
-    # Randomly pick indices from the bending cases
+    # Randomly pick indices from ONLY the pure bending cases
     val_indices = random.sample(all_bending_indices, num_val_cases)
-    print(f"Validation Cases: {len(val_indices)}" f"| Validation Indices: {sorted(val_indices)}")
+    print(f"Validation Cases: {len(val_indices)} | Validation Indices: {sorted(val_indices)}")
     
-    # Training indices: Everything that isn't a validation case (includes the remaining bends + all PE/Creep videos)
-    train_indices = [i for i in range(total_cases) if i not in val_indices]
+    # Training indices: All un-selected bending cases PLUS all special cases (Creep/PE)
+    train_indices = [i for i in all_bending_indices if i not in val_indices] + special_indices
     
     train_dataset = Subset(train_base, train_indices)
     val_dataset = Subset(val_base, val_indices)
