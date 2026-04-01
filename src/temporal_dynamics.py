@@ -36,7 +36,8 @@ class TriPlaneDynamics(nn.Module):
         self.action_mlp = nn.Sequential(
             nn.Linear(action_dim, self.action_embed_dim),
             nn.LeakyReLU(0.2),
-            nn.Linear(self.action_embed_dim, self.action_embed_dim)
+            nn.Linear(self.action_embed_dim, self.action_embed_dim),
+            nn.Tanh()
         )
         
         # 2. Hard-Coupled Physics Engine
