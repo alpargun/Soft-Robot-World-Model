@@ -48,7 +48,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/combinedDataset_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/actionConcat_visualDropout_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -148,16 +148,22 @@ def main():
         print(f"RESUMING TRAINING FROM: {RESUME_CHECKPOINT_PATH}")
         print(f"=================================================")
         checkpoint = torch.load(RESUME_CHECKPOINT_PATH, map_location=device)
+        
+        # 1. Load Model Weights
         encoder.load_state_dict(checkpoint['encoder'])
         dynamics.load_state_dict(checkpoint['dynamics'])
         decoder.load_state_dict(checkpoint['decoder'])
         
+        # 2. Load Optimizer and Scheduler States (Industry Standard)
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        
+        # 3. Re-inject the manually decayed base learning rates!
+        if 'scheduler_base_lrs' in checkpoint:
+            scheduler.base_lrs = checkpoint['scheduler_base_lrs']
+            
         start_epoch = checkpoint['epoch'] 
         best_val_loss = checkpoint['best_val_loss']
-            
-        # Fast-forward the learning rate scheduler to the correct epoch
-        for _ in range(start_epoch):
-            scheduler.step()
 
     # Define Loss Functions
     # Initialize with reduction='none' so it outputs per-pixel losses
@@ -388,11 +394,14 @@ def main():
         checkpoint_dict = {
             'epoch': epoch + 1,
             'best_val_loss': best_val_loss,
-            'train_indices': train_dataset.indices, # <--- SAVES EXACT TRAINING CASES
-            'val_indices': val_dataset.indices,     # <--- SAVES EXACT VALIDATION CASES
+            'train_indices': train_dataset.indices, 
+            'val_indices': val_dataset.indices,     
             'encoder': encoder.state_dict(),
             'dynamics': dynamics.state_dict(),
             'decoder': decoder.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scheduler_base_lrs': scheduler.base_lrs # Preserves LR decay
         }
         
         # Save the best overall model
