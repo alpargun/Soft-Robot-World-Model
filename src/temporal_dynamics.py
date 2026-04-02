@@ -31,19 +31,18 @@ class TriPlaneDynamics(nn.Module):
         self.action_dim = action_dim
         self.action_embed_dim = action_embed_dim
         
-        # 1. Action Embedding 
-        # Processes the 3 raw pressure values into a richer feature representation
+        # 1. Plane-Specific Action Embedding 
+        # Output is 48 channels (16 for each of the 3 planes)
         self.action_mlp = nn.Sequential(
-            nn.Linear(action_dim, self.action_embed_dim),
+            nn.Linear(action_dim, self.action_embed_dim * 3),
             nn.LeakyReLU(0.2),
-            nn.Linear(self.action_embed_dim, self.action_embed_dim),
+            nn.Linear(self.action_embed_dim * 3, self.action_embed_dim * 3),
             nn.Tanh()
         )
         
-        # 2. Hard-Coupled Physics Engine
-        # The ConvGRU is forced to look at the geometry and the action simultaneously
+        # 2. Physics Engine
         self.dynamics_rnn = ConvGRUCell(
-            input_dim=feature_dim + self.action_embed_dim, 
+            input_dim=feature_dim + self.action_embed_dim, # Looks at the geometry and the action simultaneously
             hidden_dim=feature_dim
         )
 
@@ -51,25 +50,23 @@ class TriPlaneDynamics(nn.Module):
         self.h0_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
 
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
-        """
-        Inputs:
-            tri_planes_t: Dict {'xy', 'xz', 'yz'} each [B, C, H, W]
-            action_t: Pressures [B, 3]
-            hidden_states_prev: Dict of previous memory states
-        """
         B, C, H, W = tri_planes_t['xy'].shape
         
-        # --- Spatial Action Concatenation ---
-        # 1. Embed the raw pressures
-        act_embed = self.action_mlp(action_t) # [B, action_embed_dim]
+        # --- Axis-Isolated Concatenation ---
+        act_embed = self.action_mlp(action_t) # [B, action_embed_dim*3]
         
-        # 2. Expand the 1D embedding into a 2D spatial grid [B, action_embed_dim, H, W]
-        act_spatial = act_embed.view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
+        # Slice into three unique 16-channel instruction sets
+        act_chunks = act_embed.chunk(3, dim=1) # 3 items of shape [B, action_embed_dim]
+        
+        # Route specific chunks to specific orthogonal planes
+        plane_actions = {
+            'xy': act_chunks[0].view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W),
+            'xz': act_chunks[1].view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W),
+            'yz': act_chunks[2].view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
+        }
         
         if hidden_states_prev is None:
-            hidden_states_prev = {
-                k: torch.tanh(self.h0_proj(v)) for k, v in tri_planes_t.items()
-            }
+            hidden_states_prev = {k: torch.tanh(self.h0_proj(v)) for k, v in tri_planes_t.items()}
             
         tri_planes_next = {}
         hidden_states_new = {}
@@ -77,12 +74,10 @@ class TriPlaneDynamics(nn.Module):
         for plane_key in ['xy', 'xz', 'yz']:
             plane_features = tri_planes_t[plane_key]
             
-            # STEP 1: The Hard-Coupling Glue
-            # We explicitly stack the geometry and the pressure together along the channel dimension.
-            # Shape becomes [B, C + action_embed_dim, H, W]
-            coupled_input = torch.cat([plane_features, act_spatial], dim=1)
+            # Grab ONLY the action instructions for this specific geometric plane
+            act_spatial = plane_actions[plane_key] 
             
-            # STEP 2: Step the Physics RNN
+            coupled_input = torch.cat([plane_features, act_spatial], dim=1)
             h_new = self.dynamics_rnn(coupled_input, hidden_states_prev[plane_key])
             
             tri_planes_next[plane_key] = h_new
