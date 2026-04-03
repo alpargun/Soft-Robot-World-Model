@@ -48,21 +48,21 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/actionConcat_visualDropout_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/projectionMLPs_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
       
     RESUME_CHECKPOINT_PATH = '' # If left empty, training starts from scratch.
     
-    BATCH_SIZE = 2 # or 4 if GPU memory allows
+    BATCH_SIZE = 4 # or 4 if GPU memory allows
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 1000
 
     FRAME_STRIDE = 2 # Skip every other frame to force learning of dynamics, not just memorization.
     SEQUENCE_LENGTH = 24
-    FEATURE_DIM = 128
-    RAYS_PER_STEP = 512 # Number of rays to sample per time step for loss calculation
+    FEATURE_DIM = 64
+    RAYS_PER_STEP = 256 # Number of rays to sample per time step for loss calculation
     TF_UNTIL = 200 # Epoch until which teacher forcing is used
 
     # Check for GPU availability
@@ -89,7 +89,7 @@ def main():
         run_folders=DATA_DIRS, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
         seq_len=None, frame_stride=FRAME_STRIDE
     )
-    
+
     # ==========================================
     # --- Validation Split ---
     # ==========================================
