@@ -53,6 +53,9 @@ class TriPlaneDynamics(nn.Module):
         )
 
         self.h0_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        
+        # Separates the clamped hidden state memory from the unbounded visual features
+        self.plane_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
 
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
         B, C, H, W = tri_planes_t['xy'].shape
@@ -74,7 +77,8 @@ class TriPlaneDynamics(nn.Module):
             coupled_input = torch.cat([tri_planes_t[plane_key], plane_actions[plane_key]], dim=1)
             h_new = self.dynamics_rnn(coupled_input, hidden_states_prev[plane_key])
             
-            tri_planes_next[plane_key] = h_new
+            # Decouple the visual plane from the bounded hidden state
+            tri_planes_next[plane_key] = self.plane_proj(h_new)
             hidden_states_new[plane_key] = h_new
             
         return tri_planes_next, hidden_states_new
