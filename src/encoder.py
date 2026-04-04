@@ -49,13 +49,6 @@ class TriPlaneEncoder(nn.Module):
             nn.GroupNorm(8, feature_dim),
             nn.ReLU(inplace=True)
         )
-        
-        # 5. YZ Plane Combiner
-        self.yz_combiner = nn.Sequential(
-            nn.Conv2d(feature_dim * 2, feature_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, feature_dim),
-            nn.ReLU(inplace=True)
-        )
 
     def forward(self, multi_view_frames):
         """
@@ -63,13 +56,7 @@ class TriPlaneEncoder(nn.Module):
             multi_view_frames: [Batch, Views=4, C, H=128, W=128]
         """
         B, Views, C, H, W = multi_view_frames.shape
-        
-        # THE FIX: If the dataloader hands us a 3-channel RGB mask from cv2.merge, 
-        # but the network is strictly configured for 1-channel, slice it.
-        if C == 3 and self.conv1.in_channels == 1:
-            multi_view_frames = multi_view_frames[:, :, 0:1, :, :]
-            C = 1 # Update C so the reshape math below doesn't break
-        
+
         # Flatten the batch and views dimensions to process all images simultaneously
         # Shape becomes: [Batch * 4, 1, 128, 128]
         flat_frames = multi_view_frames.reshape(B * Views, C, H, W)
@@ -102,9 +89,15 @@ class TriPlaneEncoder(nn.Module):
         plane_xy = f_top
         plane_xz = f_side2
         
-        # Concatenate and fuse the opposing YZ views
-        f_yz_cat = torch.cat([f_side1, f_side3], dim=1) 
-        plane_yz = self.yz_combiner(f_yz_cat)           
+        # Symmetrical Pooling for view 1 and view 3 to create the YZ plane.
+        # 1. Flip Side 3 so the geometry aligns
+        f_side3_aligned = torch.flip(f_side3, dims=[-1])
+        
+        # 2. Max pool across the two views. 
+        # For every pixel and every channel, it simply takes the strongest 
+        # signal (e.g., the clearest edge of the robot) regardless of which 
+        # camera saw it better. No extra convolution weights are needed.
+        plane_yz = torch.max(f_side1, f_side3_aligned)         
 
         return {
             "xy": plane_xy,
