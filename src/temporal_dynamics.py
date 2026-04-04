@@ -30,13 +30,6 @@ class TriPlaneDynamics(nn.Module):
         self.feature_dim = feature_dim
         self.action_embed_dim = action_embed_dim
         
-        # --- MULTIPLICATIVE GATE ---
-        # Initialized to 1.0 so gradients don't vanish, forcing the network 
-        # to use this as a strict routing map for the pressure values.
-        self.spatial_attention_xy = nn.Parameter(torch.ones(1, action_embed_dim, spatial_size, spatial_size))
-        self.spatial_attention_xz = nn.Parameter(torch.ones(1, action_embed_dim, spatial_size, spatial_size))
-        self.spatial_attention_yz = nn.Parameter(torch.ones(1, action_embed_dim, spatial_size, spatial_size))
-
         # Give each orthogonal plane its own dedicated translator.
         # Each one looks at ALL 3 pressures (P1, P2, P3) and figures out 
         # what that specific plane needs to do to maintain the 3D volume.
@@ -52,11 +45,23 @@ class TriPlaneDynamics(nn.Module):
         self.mlp_xz = build_projection_head()
         self.mlp_yz = build_projection_head()
         
-        # 2. Shared Physics Engine
-        self.dynamics_rnn = ConvGRUCell(
-            input_dim=feature_dim + action_embed_dim, 
-            hidden_dim=feature_dim
-        )
+        # ---------------------------------------------------------
+        # --- Dynamic Attention Generators ---
+        # Instead of static parameters, these mini-networks look at the 
+        # CURRENT visual shape and generate a custom mask for this exact frame.
+        # ---------------------------------------------------------
+        def build_attention_generator():
+            return nn.Sequential(
+                # Looks at both the visual state and the raw action intent
+                nn.Conv2d(feature_dim + action_embed_dim, action_embed_dim, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.2),
+                nn.Conv2d(action_embed_dim, action_embed_dim, kernel_size=3, padding=1),
+                nn.Sigmoid() # Squashes the mask smoothly between 0 (ignore) and 1 (apply)
+            )
+            
+        self.attention_gen_xy = build_attention_generator()
+        self.attention_gen_xz = build_attention_generator()
+        self.attention_gen_yz = build_attention_generator()
 
         self.h0_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
         
@@ -66,14 +71,21 @@ class TriPlaneDynamics(nn.Module):
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
         B, C, H, W = tri_planes_t['xy'].shape
         
-        act_xy = self.mlp_xy(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
-        act_xz = self.mlp_xz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
-        act_yz = self.mlp_yz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
+        # Step 1: Translate the 1D action vector into 3D instructions
+        act_xy_base = self.mlp_xy(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
+        act_xz_base = self.mlp_xz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
+        act_yz_base = self.mlp_yz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         
-        # Multiply to force spatial routing
-        act_xy = act_xy * self.spatial_attention_xy
-        act_xz = act_xz * self.spatial_attention_xz
-        act_yz = act_yz * self.spatial_attention_yz
+        # Step 2: Generate DYNAMIC masks based on the current visual state
+        # Concatenate the plane features with the base action so the generator knows both WHAT the shape is, and WHAT pressure is coming.
+        mask_xy = self.attention_gen_xy(torch.cat([tri_planes_t['xy'], act_xy_base], dim=1))
+        mask_xz = self.attention_gen_xz(torch.cat([tri_planes_t['xz'], act_xz_base], dim=1))
+        mask_yz = self.attention_gen_yz(torch.cat([tri_planes_t['yz'], act_yz_base], dim=1))
+
+        # Step 3: Apply the dynamic multiplicative masks
+        act_xy = act_xy_base * mask_xy
+        act_xz = act_xz_base * mask_xz
+        act_yz = act_yz_base * mask_yz
 
         plane_actions = {'xy': act_xy, 'xz': act_xz, 'yz': act_yz}
         
