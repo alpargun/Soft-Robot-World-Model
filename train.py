@@ -48,7 +48,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/projectionMLPs_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/symmetricalPooling_frameStacking_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -63,7 +63,8 @@ def main():
     SEQUENCE_LENGTH = 24
     FEATURE_DIM = 64
     RAYS_PER_STEP = 256 # Number of rays to sample per time step for loss calculation
-    TF_UNTIL = 200 # Epoch until which teacher forcing is used
+    
+    BURN_IN_LENGTH = 5 
 
     # Check for GPU availability
     if torch.cuda.is_available():
@@ -177,9 +178,6 @@ def main():
         
         epoch_loss = 0.0
         
-        # Calculate Teacher Forcing Ratio: Decays to 0.0 by epoch TF_UNTIL, forcing pure autoregression
-        tf_ratio = max(0.0, 1.0 - (epoch / TF_UNTIL))
-        
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
             videos = batch["video"].to(device)       
@@ -188,36 +186,49 @@ def main():
             B, Time, Views, C, H, W = videos.shape 
             
             optimizer.zero_grad()
-            batch_sequence_loss = 0.0
             
             hidden_state = None 
             
-            # Establish the initial state
+            # Establish the initial visual state
             current_tri_planes = encoder(videos[:, 0])
+
+            # Trackers for the Autoregressive Phase
+            batch_sequence_loss = 0.0
+            autoregressive_steps = 0
             
-            for t in range(Time - 1):                
+            # ==========================================
+            # --- PHASE 1: THE BURN-IN (Frames 0 to 4) ---
+            # ==========================================
+            # We step the physics engine through actual history to build up the ConvGRU's 
+            # hidden_state momentum, and to capture the hysteresis/physical state of the ANSYS
+            # mesh. NO LOSS is calculated here.
+            for t in range(BURN_IN_LENGTH - 1):
+                action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
+                
+                # Step the physics engine to build memory
+                _, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
+                
+                # Force the visual state to reality (Teacher Forcing) for the next step
+                current_tri_planes = encoder(videos[:, t+1])
+                
+            # ==========================================
+            # --- PHASE 2: PURE AUTOREGRESSION (Frames 5+) ---
+            # ==========================================
+            # The training wheels come off. We stop feeding ground-truth images. 
+            # The network is mathematically forced to read the pressure tensor 
+            # to figure out where the mass goes next. Loss is calculated here.
+            for t in range(BURN_IN_LENGTH - 1, Time - 1):
+                
                 # Action jittering: Adds small random noise to the pressures to prevent overfitting to exact values 
                 # and encourage learning of smooth dynamics. 
                 base_action = pressures[:, t]
-                # Add random noise between -0.025 and +0.025 (2.5% pressure fluctuation)
                 action_noise = (torch.rand_like(base_action) - 0.5) * 0.05
-                # Clamp the jittered action so we never feed the model impossible physics (like negative pressure)
                 action_t = torch.clamp(base_action + action_noise, min=0.00001, max=1.0)
-                                
+                
                 frames_next_true = videos[:, t+1] 
                 
-                # Predict the next 3D state
-                # ==========================================
-                # --- VISUAL DROPOUT ---
-                # ==========================================
-                # 15% of the time, we zero out the visual features.
-                # This breaks the "video retrieval" cheat code and forces the physics 
-                # engine to rely solely on the pressure inputs to calculate the next state.
-                if random.random() < 0.15:
-                    dropped_planes = {k: torch.zeros_like(v) for k, v in current_tri_planes.items()}
-                    planes_next_pred, hidden_state = dynamics(dropped_planes, action_t, hidden_state)
-                else:
-                    planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
+                # Predict the next 3D state ENTIRELY BLIND
+                planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
                 
                 # Render the current frame
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
@@ -226,7 +237,6 @@ def main():
                 
                 # 1. Combined BCE and Dice Loss (Shape: [B])
                 raw_bce = bce_loss_fn(rgb_pred, target_rgb)
-                # Average the BCE loss across spatial dimensions, keeping the batch dimension
                 loss_bce = raw_bce.view(B, -1).mean(dim=1) 
                 
                 loss_dice = dice_loss_per_batch(rgb_pred, target_rgb)
@@ -234,13 +244,9 @@ def main():
                 # 2. 3D Sparsity Loss (Shape: [B])
                 random_points_3d = (torch.rand(B, 1024, 3, device=device) * 2.0) - 1.0
                 random_probs, _ = decoder(planes_next_pred, random_points_3d)
-                
                 eps = 1e-6
-                entropy = -random_probs * torch.log(random_probs + eps) -\
-                    (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
-                
-                # Average entropy per batch item
-                sparsity_loss = entropy.view(B, -1).mean(dim=1) 
+                entropy = -random_probs * torch.log(random_probs + eps) - (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
+                sparsity_loss = entropy.view(B, -1).mean(dim=1) # Average entropy per batch item
                 lambda_sparse = 0.005
                 
                 # ==========================================
@@ -253,24 +259,16 @@ def main():
                 loss_multiplier = 1.0 + (3.0 * pressure_magnitude)
                 
                 # Sum the isolated losses, apply the specific multiplier, then reduce to a scalar
-                base_step_loss = loss_bce + loss_dice + (lambda_sparse * sparsity_loss)
-                weighted_step_loss = base_step_loss * loss_multiplier 
-                
-                # Collapse to a single scalar for .backward()
-                step_loss = weighted_step_loss.mean()
+                step_loss = ((loss_bce + loss_dice + (lambda_sparse * sparsity_loss)) * loss_multiplier).mean()
                 
                 batch_sequence_loss += step_loss
+                autoregressive_steps += 1
                 
-                # === SCHEDULED SAMPLING ===
-                # Roll a virtual die to decide if we help the AI or force it to rely on itself
-                if random.random() < tf_ratio:
-                    # Teacher Forcing: Feed it the perfect ground truth for the next step
-                    current_tri_planes = encoder(frames_next_true)
-                else:
-                    # Autoregressive: Force it to use its own noisy prediction
-                    current_tri_planes = {k: v for k, v in planes_next_pred.items()}
+                # STRICT AUTOREGRESSION: Feed our own prediction back into the engine
+                current_tri_planes = {k: v for k, v in planes_next_pred.items()}
 
-            batch_sequence_loss = batch_sequence_loss / (Time - 1)
+            # We only average the loss over the steps we actually predicted
+            batch_sequence_loss = batch_sequence_loss / autoregressive_steps
             batch_sequence_loss.backward()
             
             # Gradient clipping prevents the network from blowing up during pure autoregression
@@ -309,6 +307,7 @@ def main():
         dynamics.eval()
         decoder.eval()
         val_loss = 0.0
+        val_autoregressive_steps = 0
         
         with torch.no_grad():
             for val_batch_idx, batch in enumerate(val_loader):
@@ -316,11 +315,18 @@ def main():
                 press_val = batch["pressures"].to(device)
                 B_val, V_Time, Views, C, H, W = vids_val.shape
                 
-                # Validation is ALWAYS 100% Autoregressive (No Teacher Forcing)
                 curr_planes = encoder(vids_val[:, 0])
                 h_val = None
                 
-                for t in range(V_Time - 1):
+                # --- VAL PHASE 1: BURN-IN ---
+                # We must match the training conditions exactly so the GRU gets the same momentum warmup.
+                for t in range(BURN_IN_LENGTH - 1):
+                    action_val = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
+                    _, h_val = dynamics(curr_planes, action_val, h_val)
+                    curr_planes = encoder(vids_val[:, t+1])
+                
+                # --- VAL PHASE 2: AUTOREGRESSION ---
+                for t in range(BURN_IN_LENGTH - 1, V_Time - 1):
                     # Apply the same clamping to validation pressures
                     action_val_clamped = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
                     
@@ -333,17 +339,16 @@ def main():
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
                     # === Hybrid BCE+Dice Loss for Validation ===
-                    # 1. Calculate per-batch BCE (matching training logic)
                     raw_bce_val = bce_loss_fn(rgb_p, target)
                     loss_bce_val = raw_bce_val.view(B_val, -1).mean(dim=1)
-                    # 2. Calculate per-batch Dice
                     loss_dice_val = dice_loss_per_batch(rgb_p, target)
                     
                     val_step_loss = (loss_bce_val + loss_dice_val).mean()
                     val_loss += val_step_loss.item()
+                    val_autoregressive_steps += 1
                     
                     # ---------------------------------------------------------
-                    # VALIDATION VISUALIZATION BLOCK (100% Autoregressive)
+                    # VALIDATION VISUALIZATION BLOCK
                     # ---------------------------------------------------------
                     # Log every 10 epochs, ONLY on the first validation batch
                     if (epoch + 1) % 10 == 0 and val_batch_idx == 0 and (t == (V_Time // 2) or t == (V_Time - 2)):
@@ -361,13 +366,11 @@ def main():
                             full_rgb_pred = ray_marcher.render_rays(
                                 decoder, single_plane_pred, full_ray_origins, full_ray_dirs)
                             
-                            pred_frame = full_rgb_pred.view(H, W, 3).permute(2, 0, 1).detach().cpu()
+                            pred_frame = full_rgb_pred.view(H, W, C).permute(2, 0, 1).detach().cpu()
                             
                             comparison_grid = torch.cat((real_frame, pred_frame), dim=2)
-                            # Tag clearly as Validation in TensorBoard
                             writer.add_image(f'Validation_Autoregressive_{stage_name}/Side_{v+1}', comparison_grid, epoch + 1)
                     
-                    # Strictly feed prediction back into the engine
                     curr_planes = pred_planes
                     
                 # Clean up Validation Memory too
@@ -378,13 +381,11 @@ def main():
                     torch.cuda.empty_cache()
                 gc.collect()
                     
-        avg_val_loss = val_loss / (len(val_loader) * (V_Time - 1))
+        avg_val_loss = val_loss / val_autoregressive_steps
         
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | TF Ratio: {tf_ratio:.2f} |\
-            Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
-        writer.add_scalar('Training/TF_Ratio', tf_ratio, epoch + 1)
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
