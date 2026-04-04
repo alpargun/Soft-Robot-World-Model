@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import StructuralSimilarityIndexMeasure
 from tqdm import tqdm
 import gc
 
@@ -33,6 +32,24 @@ def dice_loss_per_batch(pred, target, smooth=1e-5):
     dice_coeff = (2.0 * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
     
     return 1.0 - dice_coeff # Returns a tensor of shape [B]
+
+def calculate_iou(pred, target, threshold=0.5):
+    """
+    Calculates the Intersection over Union (IoU) for binary masks.
+    Ignores the background and strictly grades the silhouette shape.
+    """
+    # Convert soft predictions and targets to hard binary masks
+    pred_bin = (pred > threshold).float()
+    target_bin = (target > 0.5).float()
+    
+    # Calculate intersection and union over the spatial/channel dimensions
+    intersection = (pred_bin * target_bin).sum(dim=[1, 2]) 
+    union = pred_bin.sum(dim=[1, 2]) + target_bin.sum(dim=[1, 2]) - intersection
+    
+    # Avoid division by zero
+    iou = (intersection + 1e-6) / (union + 1e-6)
+    
+    return iou.mean() # Return the batch average
 
 def main():
     
@@ -312,7 +329,7 @@ def main():
         dynamics.eval()
         decoder.eval()
         val_loss = 0.0
-        val_ssim = 0.0
+        val_iou = 0.0
         val_autoregressive_steps = 0
         
         with torch.no_grad():
@@ -323,8 +340,6 @@ def main():
                 
                 curr_planes = encoder(vids_val[:, 0])
                 h_val = None
-                
-                ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
 
                 # --- VAL PHASE 1: BURN-IN ---
                 # Kept strictly at BURN_IN_LENGTH so validation metrics remain 
@@ -356,9 +371,8 @@ def main():
                     val_loss += val_step_loss.item()
                     val_autoregressive_steps += 1
                     
-                    # Full Image SSIM Calculation
-                    # rgb_p only contains 256 scattered rays. SSIM requires a full 2D grid.
-                    # We render the full image for view 0 (Side 1) to get an accurate SSIM metric without slowing down validation too much.
+                    # Full Image IoU Calculation
+                    # We render the full image for view 0 (Side 1) to get an accurate IoU metric without slowing down validation too much.
                     full_ray_o, full_ray_d = get_full_image_rays(H, W, view_idx=0, device=device)
                     full_ray_o = full_ray_o.unsqueeze(0).expand(B_val, -1, -1)
                     full_ray_d = full_ray_d.unsqueeze(0).expand(B_val, -1, -1)
@@ -366,11 +380,8 @@ def main():
                     full_rgb_p = render_rays_chunked(ray_marcher, decoder, pred_planes, full_ray_o, full_ray_d, chunk_size=4096)
                     full_target = vids_val[:, t+1, 0].permute(0, 2, 3, 1).reshape(B_val, H*W, 1)
 
-                    # Reshape to [B, C, H, W] for SSIM 
-                    rgb_img = full_rgb_p.view(B_val, H, W, 1).permute(0, 3, 1, 2)
-                    target_img = full_target.view(B_val, H, W, 1).permute(0, 3, 1, 2)
-
-                    val_ssim += ssim_metric(rgb_img, target_img).item()
+                    # Calculate IoU directly on the flat rays
+                    val_iou += calculate_iou(full_rgb_p, full_target).item()
 
                     # ---------------------------------------------------------
                     # VALIDATION VISUALIZATION BLOCK
@@ -399,7 +410,7 @@ def main():
                     curr_planes = pred_planes
                     
                 # Clean up Validation Memory too
-                del vids_val, press_val, curr_planes, h_val
+                del vids_val, press_val, curr_planes, h_val, full_rgb_p, full_target
                 if str(device) == "mps":
                     torch.mps.empty_cache()
                 elif str(device) == "cuda":
@@ -407,13 +418,13 @@ def main():
                 gc.collect()
                     
         avg_val_loss = val_loss / val_autoregressive_steps
-        avg_val_ssim = val_ssim / val_autoregressive_steps # Average the SSIM over steps
+        avg_val_iou = val_iou / val_autoregressive_steps # Average the IoU over steps
         
-        # Print and Log SSIM to TensorBoard
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f} | Val SSIM: {avg_val_ssim:.4f}")
+        # Print and Log IoU to TensorBoard
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f} | Val IoU: {avg_val_iou:.4f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
-        writer.add_scalar('Training/Validation_SSIM', avg_val_ssim, epoch + 1)
+        writer.add_scalar('Training/Validation_IoU', avg_val_iou, epoch + 1)
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
