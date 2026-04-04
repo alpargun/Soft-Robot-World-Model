@@ -65,7 +65,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/decoupledVisualState_ColdStart_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/1_spatialAttention_TF_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -82,6 +82,8 @@ def main():
     RAYS_PER_STEP = 256 # Number of rays to sample per time step for loss calculation
     
     BURN_IN_LENGTH = 5 
+    TF_UNTIL = 100.0 # Number of epochs to apply teacher forcing. After this, it decays to 0.
+    VAL_PERCENTAGE = 0.15 # Percentage of pure bending cases to hold out for validation
 
     # Check for GPU availability
     if torch.cuda.is_available():
@@ -122,8 +124,6 @@ def main():
         else:
             # Captures Staircase, PE, or any other non-standard folders
             special_indices.append(idx)
-            
-    VAL_PERCENTAGE = 0.15
     
     # Set seed for reproducible splits across runs.
     random.seed(42)
@@ -146,7 +146,7 @@ def main():
 
     # 3. Initialize Model Components
     encoder = TriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
-    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=16).to(device)
+    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=32).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
 
@@ -194,6 +194,9 @@ def main():
         decoder.train()
         
         epoch_loss = 0.0
+
+        # Start with 100% Teacher Forcing, decaying smoothly to 0% by Epoch 150
+        teacher_forcing_ratio = max(0.0, 1.0 - (epoch / TF_UNTIL))
         
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
@@ -237,7 +240,7 @@ def main():
                 current_tri_planes = encoder(videos[:, t+1])
                 
             # ==========================================
-            # --- PHASE 2: PURE AUTOREGRESSION ---
+            # --- PHASE 2: AUTOREGRESSION ---
             # ==========================================
             for t in range(current_burn_in - 1, Time - 1):
                 
@@ -286,8 +289,13 @@ def main():
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
-                # STRICT AUTOREGRESSION: Feed our own prediction back into the engine
-                current_tri_planes = {k: v for k, v in planes_next_pred.items()}
+                # --- SCHEDULED SAMPLING FEEDBACK ---
+                if random.random() < teacher_forcing_ratio:
+                    # Provide the real previous frame to prevent early gradient panic
+                    current_tri_planes = encoder(frames_next_true)
+                else:
+                    # Strict Autoregression: Feed our own prediction back
+                    current_tri_planes = {k: v for k, v in planes_next_pred.items()}
 
             # We only average the loss over the steps we actually predicted
             batch_sequence_loss = batch_sequence_loss / autoregressive_steps

@@ -25,21 +25,21 @@ class ConvGRUCell(nn.Module):
         return h_new
 
 class TriPlaneDynamics(nn.Module):
-    def __init__(self, feature_dim=64, action_dim=3, action_embed_dim=16, spatial_size=32):
+    def __init__(self, feature_dim=64, action_dim=3, action_embed_dim=32, spatial_size=32):
         super().__init__()
         self.feature_dim = feature_dim
         self.action_embed_dim = action_embed_dim
         
-        # Independent Spatial Heatmaps ---
-        # Each orthogonal projection gets its own dedicated coordinate awareness
-        self.spatial_bias_xy = nn.Parameter(torch.randn(1, action_embed_dim, spatial_size, spatial_size) * 0.02)
-        self.spatial_bias_xz = nn.Parameter(torch.randn(1, action_embed_dim, spatial_size, spatial_size) * 0.02)
-        self.spatial_bias_yz = nn.Parameter(torch.randn(1, action_embed_dim, spatial_size, spatial_size) * 0.02)
+        # --- MULTIPLICATIVE GATE ---
+        # Initialized to 1.0 so gradients don't vanish, forcing the network 
+        # to use this as a strict routing map for the pressure values.
+        self.spatial_attention_xy = nn.Parameter(torch.ones(1, action_embed_dim, spatial_size, spatial_size))
+        self.spatial_attention_xz = nn.Parameter(torch.ones(1, action_embed_dim, spatial_size, spatial_size))
+        self.spatial_attention_yz = nn.Parameter(torch.ones(1, action_embed_dim, spatial_size, spatial_size))
 
         # Give each orthogonal plane its own dedicated translator.
         # Each one looks at ALL 3 pressures (P1, P2, P3) and figures out 
         # what that specific plane needs to do to maintain the 3D volume.
-        
         def build_projection_head():
             return nn.Sequential(
                 nn.Linear(action_dim, action_embed_dim),
@@ -66,15 +66,14 @@ class TriPlaneDynamics(nn.Module):
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
         B, C, H, W = tri_planes_t['xy'].shape
         
-        # Generate custom instructions for each plane using the FULL action vector
         act_xy = self.mlp_xy(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         act_xz = self.mlp_xz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         act_yz = self.mlp_yz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         
-        # Map the independent spatial biases to their specific planes
-        act_xy = act_xy + self.spatial_bias_xy
-        act_xz = act_xz + self.spatial_bias_xz
-        act_yz = act_yz + self.spatial_bias_yz
+        # Multiply to force spatial routing
+        act_xy = act_xy * self.spatial_attention_xy
+        act_xz = act_xz * self.spatial_attention_xz
+        act_yz = act_yz * self.spatial_attention_yz
 
         plane_actions = {'xy': act_xy, 'xz': act_xz, 'yz': act_yz}
         
