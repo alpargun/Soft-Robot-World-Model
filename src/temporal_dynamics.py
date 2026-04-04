@@ -25,7 +25,7 @@ class ConvGRUCell(nn.Module):
         return h_new
 
 class TriPlaneDynamics(nn.Module):
-    def __init__(self, feature_dim=64, action_dim=3, action_embed_dim=32, spatial_size=32):
+    def __init__(self, feature_dim=64, action_dim=3, action_embed_dim=32):
         super().__init__()
         self.feature_dim = feature_dim
         self.action_embed_dim = action_embed_dim
@@ -53,7 +53,8 @@ class TriPlaneDynamics(nn.Module):
         def build_attention_generator():
             return nn.Sequential(
                 # Looks at both the visual state and the raw action intent
-                nn.Conv2d(feature_dim + action_embed_dim, action_embed_dim, kernel_size=3, padding=1),
+                # feature_dim (Visual) + action_embed_dim (Action) + feature_dim (History/Hysteresis)
+                nn.Conv2d((feature_dim * 2) + action_embed_dim, action_embed_dim, kernel_size=3, padding=1),
                 nn.LeakyReLU(0.2),
                 nn.Conv2d(action_embed_dim, action_embed_dim, kernel_size=3, padding=1),
                 nn.Sigmoid() # Squashes the mask smoothly between 0 (ignore) and 1 (apply)
@@ -62,6 +63,11 @@ class TriPlaneDynamics(nn.Module):
         self.attention_gen_xy = build_attention_generator()
         self.attention_gen_xz = build_attention_generator()
         self.attention_gen_yz = build_attention_generator()
+
+        self.dynamics_rnn = ConvGRUCell(
+            input_dim=feature_dim + action_embed_dim, 
+            hidden_dim=feature_dim
+        )
 
         self.h0_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
         
@@ -76,21 +82,22 @@ class TriPlaneDynamics(nn.Module):
         act_xz_base = self.mlp_xz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         act_yz_base = self.mlp_yz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         
-        # Step 2: Generate DYNAMIC masks based on the current visual state
-        # Concatenate the plane features with the base action so the generator knows both WHAT the shape is, and WHAT pressure is coming.
-        mask_xy = self.attention_gen_xy(torch.cat([tri_planes_t['xy'], act_xy_base], dim=1))
-        mask_xz = self.attention_gen_xz(torch.cat([tri_planes_t['xz'], act_xz_base], dim=1))
-        mask_yz = self.attention_gen_yz(torch.cat([tri_planes_t['yz'], act_yz_base], dim=1))
+        # Step 2: Initialize hidden states on the first forward pass using the initial visual state as a reference
+        if hidden_states_prev is None:
+            hidden_states_prev = {k: torch.tanh(self.h0_proj(v)) for k, v in tri_planes_t.items()}
+        
+        # 3. HYSTERESIS-AWARE DYNAMIC MASKS
+        # The generator now looks at: Current Shape + Current Pressure + Physical Memory
+        mask_xy = self.attention_gen_xy(torch.cat([tri_planes_t['xy'], act_xy_base, hidden_states_prev['xy']], dim=1))
+        mask_xz = self.attention_gen_xz(torch.cat([tri_planes_t['xz'], act_xz_base, hidden_states_prev['xz']], dim=1))
+        mask_yz = self.attention_gen_yz(torch.cat([tri_planes_t['yz'], act_yz_base, hidden_states_prev['yz']], dim=1))
 
-        # Step 3: Apply the dynamic multiplicative masks
+        # 4. Apply Masks
         act_xy = act_xy_base * mask_xy
         act_xz = act_xz_base * mask_xz
         act_yz = act_yz_base * mask_yz
 
         plane_actions = {'xy': act_xy, 'xz': act_xz, 'yz': act_yz}
-        
-        if hidden_states_prev is None:
-            hidden_states_prev = {k: torch.tanh(self.h0_proj(v)) for k, v in tri_planes_t.items()}
             
         tri_planes_next = {}
         hidden_states_new = {}
