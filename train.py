@@ -48,7 +48,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/symmetricalPooling_frameStacking_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/decoupledVisualState_ColdStart_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -197,12 +197,20 @@ def main():
             autoregressive_steps = 0
             
             # ==========================================
-            # --- PHASE 1: THE BURN-IN (Frames 0 to 4) ---
+            # --- DYNAMIC BURN-IN SELECTION ---
             # ==========================================
-            # We step the physics engine through actual history to build up the ConvGRU's 
-            # hidden_state momentum, and to capture the hysteresis/physical state of the ANSYS
-            # mesh. NO LOSS is calculated here.
-            for t in range(BURN_IN_LENGTH - 1):
+            # 30% of the time, we force a "Cold Start". The network gets NO 
+            # visual momentum history and must learn to break static inertia 
+            # and map pressure to movement from a dead stop.
+            if random.random() < 0.70:
+                current_burn_in = BURN_IN_LENGTH
+            else:
+                current_burn_in = 1
+            
+            # ==========================================
+            # --- PHASE 1: THE BURN-IN ---
+            # ==========================================
+            for t in range(current_burn_in - 1):
                 action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
                 
                 # Step the physics engine to build memory
@@ -212,12 +220,9 @@ def main():
                 current_tri_planes = encoder(videos[:, t+1])
                 
             # ==========================================
-            # --- PHASE 2: PURE AUTOREGRESSION (Frames 5+) ---
+            # --- PHASE 2: PURE AUTOREGRESSION ---
             # ==========================================
-            # The training wheels come off. We stop feeding ground-truth images. 
-            # The network is mathematically forced to read the pressure tensor 
-            # to figure out where the mass goes next. Loss is calculated here.
-            for t in range(BURN_IN_LENGTH - 1, Time - 1):
+            for t in range(current_burn_in - 1, Time - 1):
                 
                 # Action jittering: Adds small random noise to the pressures to prevent overfitting to exact values 
                 # and encourage learning of smooth dynamics. 
@@ -319,7 +324,8 @@ def main():
                 h_val = None
                 
                 # --- VAL PHASE 1: BURN-IN ---
-                # We must match the training conditions exactly so the GRU gets the same momentum warmup.
+                # Kept strictly at BURN_IN_LENGTH so validation metrics remain 
+                # completely stable and comparable epoch-to-epoch.
                 for t in range(BURN_IN_LENGTH - 1):
                     action_val = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
                     _, h_val = dynamics(curr_planes, action_val, h_val)
