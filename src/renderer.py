@@ -229,3 +229,24 @@ def get_full_image_rays(H, W, view_idx=0, device='cuda'):
         ray_dirs[..., 2] = -1.0
 
     return ray_origins, ray_dirs
+
+def render_rays_chunked(ray_marcher, decoder, curr_planes, ray_origins, ray_dirs, chunk_size=4096):
+    """
+    Memory-safe wrapper for VolumetricRayMarcher.
+    Splits a massive bundle of rays into smaller chunks to prevent VRAM OOM crashes.
+    """
+    B, num_rays, _ = ray_origins.shape
+    device = ray_origins.device
+    all_rgb = []
+    
+    with torch.no_grad():
+        for i in range(0, num_rays, chunk_size):
+            origins_chunk = ray_origins[:, i:i+chunk_size, :]
+            dirs_chunk = ray_dirs[:, i:i+chunk_size, :]
+            
+            # Call your existing render function on just this small block
+            rgb_chunk = ray_marcher.render_rays(decoder, curr_planes, origins_chunk, dirs_chunk)
+            all_rgb.append(rgb_chunk)
+            
+    # Stitch the rendered blocks back together
+    return torch.cat(all_rgb, dim=1)

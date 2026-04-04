@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 from tqdm import tqdm
 import gc
 
@@ -17,8 +18,7 @@ from src.multiview_dataset import SoftRobotDataset
 from src.encoder import TriPlaneEncoder
 from src.temporal_dynamics import TriPlaneDynamics
 from src.decoder import TriPlaneDecoder
-from src.renderer import VolumetricRayMarcher, sample_orthographic_rays, get_full_image_rays
-
+from src.renderer import VolumetricRayMarcher, sample_orthographic_rays, get_full_image_rays, render_rays_chunked
 
 def dice_loss_per_batch(pred, target, smooth=1e-5):
     # Preserve the batch dimension [B], flatten the spatial/channel dimensions [-1]
@@ -312,6 +312,7 @@ def main():
         dynamics.eval()
         decoder.eval()
         val_loss = 0.0
+        val_ssim = 0.0
         val_autoregressive_steps = 0
         
         with torch.no_grad():
@@ -323,6 +324,8 @@ def main():
                 curr_planes = encoder(vids_val[:, 0])
                 h_val = None
                 
+                ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+
                 # --- VAL PHASE 1: BURN-IN ---
                 # Kept strictly at BURN_IN_LENGTH so validation metrics remain 
                 # completely stable and comparable epoch-to-epoch.
@@ -353,6 +356,22 @@ def main():
                     val_loss += val_step_loss.item()
                     val_autoregressive_steps += 1
                     
+                    # Full Image SSIM Calculation
+                    # rgb_p only contains 256 scattered rays. SSIM requires a full 2D grid.
+                    # We render the full image for view 0 (Side 1) to get an accurate SSIM metric without slowing down validation too much.
+                    full_ray_o, full_ray_d = get_full_image_rays(H, W, view_idx=0, device=device)
+                    full_ray_o = full_ray_o.unsqueeze(0).expand(B_val, -1, -1)
+                    full_ray_d = full_ray_d.unsqueeze(0).expand(B_val, -1, -1)
+                    
+                    full_rgb_p = render_rays_chunked(ray_marcher, decoder, pred_planes, full_ray_o, full_ray_d, chunk_size=4096)
+                    full_target = vids_val[:, t+1, 0].permute(0, 2, 3, 1).reshape(B_val, H*W, 1)
+
+                    # Reshape to [B, C, H, W] for SSIM 
+                    rgb_img = full_rgb_p.view(B_val, H, W, 1).permute(0, 3, 1, 2)
+                    target_img = full_target.view(B_val, H, W, 1).permute(0, 3, 1, 2)
+
+                    val_ssim += ssim_metric(rgb_img, target_img).item()
+
                     # ---------------------------------------------------------
                     # VALIDATION VISUALIZATION BLOCK
                     # ---------------------------------------------------------
@@ -367,10 +386,10 @@ def main():
                             full_ray_origins = full_ray_origins.unsqueeze(0)
                             full_ray_dirs = full_ray_dirs.unsqueeze(0)
                             
-                            # Render the full image for the first video in the batch [0:1]
+                            # Safely render the full image using the chunked method
                             single_plane_pred = {key: pred_planes[key][0:1] for key in pred_planes} 
-                            full_rgb_pred = ray_marcher.render_rays(
-                                decoder, single_plane_pred, full_ray_origins, full_ray_dirs)
+                            full_rgb_pred = render_rays_chunked(
+                                ray_marcher, decoder, single_plane_pred, full_ray_origins, full_ray_dirs, chunk_size=4096)
                             
                             pred_frame = full_rgb_pred.view(H, W, C).permute(2, 0, 1).detach().cpu()
                             
@@ -388,10 +407,13 @@ def main():
                 gc.collect()
                     
         avg_val_loss = val_loss / val_autoregressive_steps
+        avg_val_ssim = val_ssim / val_autoregressive_steps # Average the SSIM over steps
         
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+        # Print and Log SSIM to TensorBoard
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f} | Val SSIM: {avg_val_ssim:.4f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
+        writer.add_scalar('Training/Validation_SSIM', avg_val_ssim, epoch + 1)
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
