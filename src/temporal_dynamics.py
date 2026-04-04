@@ -25,11 +25,17 @@ class ConvGRUCell(nn.Module):
         return h_new
 
 class TriPlaneDynamics(nn.Module):
-    def __init__(self, feature_dim=64, action_dim=3, action_embed_dim=16):
+    def __init__(self, feature_dim=64, action_dim=3, action_embed_dim=16, spatial_size=32):
         super().__init__()
         self.feature_dim = feature_dim
         self.action_embed_dim = action_embed_dim
         
+        # Independent Spatial Heatmaps ---
+        # Each orthogonal projection gets its own dedicated coordinate awareness
+        self.spatial_bias_xy = nn.Parameter(torch.randn(1, action_embed_dim, spatial_size, spatial_size) * 0.02)
+        self.spatial_bias_xz = nn.Parameter(torch.randn(1, action_embed_dim, spatial_size, spatial_size) * 0.02)
+        self.spatial_bias_yz = nn.Parameter(torch.randn(1, action_embed_dim, spatial_size, spatial_size) * 0.02)
+
         # Give each orthogonal plane its own dedicated translator.
         # Each one looks at ALL 3 pressures (P1, P2, P3) and figures out 
         # what that specific plane needs to do to maintain the 3D volume.
@@ -65,6 +71,11 @@ class TriPlaneDynamics(nn.Module):
         act_xz = self.mlp_xz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         act_yz = self.mlp_yz(action_t).view(B, self.action_embed_dim, 1, 1).expand(B, self.action_embed_dim, H, W)
         
+        # Map the independent spatial biases to their specific planes
+        act_xy = act_xy + self.spatial_bias_xy
+        act_xz = act_xz + self.spatial_bias_xz
+        act_yz = act_yz + self.spatial_bias_yz
+
         plane_actions = {'xy': act_xy, 'xz': act_xz, 'yz': act_yz}
         
         if hidden_states_prev is None:
