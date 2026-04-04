@@ -16,7 +16,7 @@ class VolumetricRayMarcher(nn.Module):
             ray_origins: Camera positions [B, Num_Rays, 3]
             ray_directions: Ray vectors [B, Num_Rays, 3]
         Outputs:
-            rendered_colors: The final 2D pixels [B, Num_Rays, 3]
+            rendered_colors: The final 2D pixels [B, Num_Rays, Channels]
         """
         B, num_rays, _ = ray_origins.shape
         device = ray_origins.device
@@ -66,10 +66,6 @@ class VolumetricRayMarcher(nn.Module):
         
         # Sum the weighted colors (Result is [B, num_rays, out_channels])
         rendered_colors = torch.sum(weights.unsqueeze(-1) * rgb, dim=-2)
-
-        # Duplicate 1-channel mask to 3 channels so TensorBoard and OpenCV don't crash
-        if rendered_colors.shape[-1] == 1:
-            rendered_colors = rendered_colors.repeat(1, 1, 3)
             
         return rendered_colors
     
@@ -78,7 +74,7 @@ class VolumetricRayMarcher(nn.Module):
 def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask"):
     """
     Maps 2D pixel coordinates to 3D continuous ray origins and directions.
-    target_frames: Ground truth video tensor [Batch, Views=4, Channels=3, H=128, W=128]
+    target_frames: Ground truth video tensor [Batch, Views=4, Channels=C, H=128, W=128]
     image_mode: Toggles between random scatter ("mask") and contiguous patches ("rgb")
     """
     B, Views, C, H, W = target_frames.shape
@@ -180,7 +176,7 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
     # Combine all views into a single batch of rays
     origins = torch.cat(origins_list, dim=1)         # [B, num_samples, 3]
     directions = torch.cat(directions_list, dim=1)   # [B, num_samples, 3]
-    target_rgb = torch.cat(target_rgb_list, dim=1)   # [B, num_samples, 3]
+    target_rgb = torch.cat(target_rgb_list, dim=1)   # [B, num_samples, C]
 
     return origins, directions, target_rgb
 
