@@ -28,6 +28,10 @@ class SoftRobotDataset(Dataset):
         self.img_size = img_size
         self.crop_size = crop_size
         self.image_mode = image_mode.lower()
+        
+        if self.image_mode != "mask":
+            raise ValueError(f"Unsupported image_mode: '{self.image_mode}'. Currently, only 'mask' is supported to optimize VRAM.")
+            
         self.seq_len = seq_len 
         self.frame_stride = frame_stride # Temporal stride to skip frames
         
@@ -70,7 +74,7 @@ class SoftRobotDataset(Dataset):
         case_folder = self.case_folders[idx]
 
         # Embed the specific parameters into the filename
-        cache_name = f"processed_cache_{self.image_mode}_{self.img_size[0]}x{self.img_size[1]}_crop{self.crop_size}.pt"
+        cache_name = f"processed_cache_1c_{self.image_mode}_{self.img_size[0]}x{self.img_size[1]}_crop{self.crop_size}.pt"
         cache_file_path = os.path.join(case_folder, cache_name)
         
         # Skip OpenCV processing if it is in the cache (Load directly from disk)
@@ -103,54 +107,43 @@ class SoftRobotDataset(Dataset):
                         cx, cy = w // 2, h // 2
                         half = self.crop_size // 2
                         frame = frame[max(0, cy-half):min(h, cy+half), max(0, cx-half):min(w, cx+half)]
+
+                    # MASK MODE PROCESSING
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+                    edges = cv2.Canny(blurred, 20, 100)
+
+                    kernel = np.ones((5, 5), np.uint8)
+                    dilated = cv2.dilate(edges, kernel, iterations=2)
+                    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                    mask = np.zeros_like(gray)
+                    if contours:
+                        largest_contour = max(contours, key=cv2.contourArea)
+                        cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+
+                    mask = cv2.erode(mask, kernel, iterations=2)
                     
-                    # --- MULTI-MODE PROCESSING ---
-                    if self.image_mode == "rgb":
-                        frame_c = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        frame_resized = cv2.resize(frame_c, self.img_size, interpolation=cv2.INTER_AREA)
-                        frame_tensor = frame_resized.astype(np.float32) / 255.0
-                        
-                    elif self.image_mode == "grayscale":
-                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        frame_resized = cv2.resize(gray, self.img_size, interpolation=cv2.INTER_AREA)
-                        # Merge to 3 channels to keep ResNet architecture consistent
-                        frame_c = cv2.merge([frame_resized, frame_resized, frame_resized])
-                        frame_tensor = frame_c.astype(np.float32) / 255.0
-
-                    elif self.image_mode == "mask":
-                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-                        edges = cv2.Canny(blurred, 20, 100)
-
-                        kernel = np.ones((5, 5), np.uint8)
-                        dilated = cv2.dilate(edges, kernel, iterations=2)
-                        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-                        mask = np.zeros_like(gray)
-                        if contours:
-                            largest_contour = max(contours, key=cv2.contourArea)
-                            cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
-
-                        mask = cv2.erode(mask, kernel, iterations=2)
-                        
-                        # Ultimate cleanup pass to ensure a single solid silhouette with no holes or noise
-                        final_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        clean_mask = np.zeros_like(mask)
-                        if final_contours:
-                            true_largest = max(final_contours, key=cv2.contourArea)
-                            cv2.drawContours(clean_mask, [true_largest], -1, 255, thickness=cv2.FILLED)
-                        
-                        # KEY FIX: INTER_NEAREST prevents halo artifacts during downscaling
-                        mask_resized = cv2.resize(clean_mask, self.img_size, interpolation=cv2.INTER_NEAREST)
-                        mask_3c = cv2.merge([mask_resized, mask_resized, mask_resized])
-                        frame_tensor = mask_3c.astype(np.float32) / 255.0 
+                    # Ultimate cleanup pass to ensure a single solid silhouette with no holes or noise
+                    final_contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    clean_mask = np.zeros_like(mask)
+                    if final_contours:
+                        true_largest = max(final_contours, key=cv2.contourArea)
+                        cv2.drawContours(clean_mask, [true_largest], -1, 255, thickness=cv2.FILLED)
                     
-                    # Channel-first format: [C, H, W]
+                    # INTER_NEAREST prevents halo artifacts during downscaling
+                    mask_resized = cv2.resize(clean_mask, self.img_size, interpolation=cv2.INTER_NEAREST)
+
+                    # Instead of merging 3 channels, just add the channel dimension to the 2D array
+                    mask_1c = np.expand_dims(mask_resized, axis=2) 
+                    frame_tensor = mask_1c.astype(np.float32) / 255.0
+                    
+                    # Channel-first format: [C, H, W] -> Now explicitly [1, 128, 128]
                     frame_tensor = np.transpose(frame_tensor, (2, 0, 1))
                     frames.append(frame_tensor)
                     
                 cap.release()
-                video_tensor = torch.tensor(np.array(frames)) # [Time, 3, 128, 128]
+                video_tensor = torch.tensor(np.array(frames)) # [Time, 1, 128, 128]
                 all_views_frames.append(video_tensor)
                 num_frames_in_video = len(frames)
                 
