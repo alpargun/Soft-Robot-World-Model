@@ -141,8 +141,11 @@ def main():
     val_dataset = Subset(val_base, val_indices)
     print(f"Data Split -> Training Cases: {len(train_dataset)} | Validation Cases: {len(val_dataset)}")
     
-    dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+    dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    if len(dataloader) == 0:
+        raise ValueError("Training dataloader is empty! Check your DATA_DIRS and split logic.")
 
     # 3. Initialize Model Components
     encoder = TriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
@@ -197,6 +200,7 @@ def main():
 
         # Start with 100% Teacher Forcing, decaying smoothly to 0% by Epoch 150
         teacher_forcing_ratio = max(0.0, 1.0 - (epoch / TF_UNTIL))
+        writer.add_scalar('Training/Teacher_Forcing_Ratio', teacher_forcing_ratio, epoch)
         
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
@@ -219,10 +223,10 @@ def main():
             # ==========================================
             # --- DYNAMIC BURN-IN SELECTION ---
             # ==========================================
-            # 30% of the time, we force a "Cold Start". The network gets NO 
+            # 50% of the time, we force a "Cold Start". The network gets NO 
             # visual momentum history and must learn to break static inertia 
             # and map pressure to movement from a dead stop.
-            if random.random() < 0.70:
+            if random.random() < 0.50:
                 current_burn_in = BURN_IN_LENGTH
             else:
                 current_burn_in = 1
@@ -298,14 +302,15 @@ def main():
                     current_tri_planes = {k: v for k, v in planes_next_pred.items()}
 
             # We only average the loss over the steps we actually predicted
-            batch_sequence_loss = batch_sequence_loss / autoregressive_steps
-            batch_sequence_loss.backward()
-            
-            # Gradient clipping prevents the network from blowing up during pure autoregression
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-            optimizer.step()
-            
-            epoch_loss += batch_sequence_loss.item()
+            if autoregressive_steps > 0:
+                batch_sequence_loss = batch_sequence_loss / autoregressive_steps
+                batch_sequence_loss.backward()
+                
+                # Gradient clipping prevents the network from blowing up during pure autoregression
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                optimizer.step()
+                
+                epoch_loss += batch_sequence_loss.item()
             
             # --- AGGRESSIVE MEMORY CLEANUP FOR MACS ---
             # Deleting these heavy tensors and explicitly clearing the cache prevents fragmentation crashes
@@ -328,7 +333,7 @@ def main():
             scheduler.base_lrs = [base_lr * 0.5 for base_lr in scheduler.base_lrs]
             print(f">>> LR Warm Restart: Peak decayed to {scheduler.base_lrs[0]:.6f}")
             
-        avg_loss = epoch_loss / len(dataloader)
+        avg_loss = epoch_loss / max(1, len(dataloader)) 
         
         # ==========================================
         # --- VALIDATION PHASE ---
@@ -338,7 +343,9 @@ def main():
         decoder.eval()
         val_loss = 0.0
         val_iou = 0.0
+        val_cold_start_iou = 0.0 # Tracks absolute Open-Loop performance
         val_autoregressive_steps = 0
+        val_cold_start_steps = 0 # Tracks steps for the cold start evaluation
         
         with torch.no_grad():
             for val_batch_idx, batch in enumerate(val_loader):
@@ -416,29 +423,65 @@ def main():
                             writer.add_image(f'Validation_Autoregressive_{stage_name}/Side_{v+1}', comparison_grid, epoch + 1)
                     
                     curr_planes = pred_planes
+                
+                # ---------------------------------------------------------
+                # --- COLD START EVALUATION (NO BURN-IN) ---
+                # ---------------------------------------------------------
+                # The network is forced to simulate the entire sequence starting 
+                # strictly from t=0, making it impossible to cheat using visual momentum.
+                curr_planes_cold = encoder(vids_val[:, 0])
+                h_val_cold = None
+                
+                for t in range(V_Time - 1):
+                    action_val_clamped = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
                     
+                    pred_planes_cold, h_val_cold = dynamics(curr_planes_cold, action_val_clamped, h_val_cold)
+                    
+                    # Full Image IoU Calculation for view 0
+                    full_ray_o_cold, full_ray_d_cold = get_full_image_rays(H, W, view_idx=0, device=device)
+                    full_ray_o_cold = full_ray_o_cold.unsqueeze(0).expand(B_val, -1, -1)
+                    full_ray_d_cold = full_ray_d_cold.unsqueeze(0).expand(B_val, -1, -1)
+                    
+                    full_rgb_p_cold = render_rays_chunked(ray_marcher, decoder, pred_planes_cold, full_ray_o_cold, full_ray_d_cold, chunk_size=4096)
+                    full_target_cold = vids_val[:, t+1, 0].permute(0, 2, 3, 1).reshape(B_val, H*W, 1)
+
+                    val_cold_start_iou += calculate_iou(full_rgb_p_cold, full_target_cold).item()
+                    val_cold_start_steps += 1
+                    
+                    curr_planes_cold = pred_planes_cold
+
                 # Clean up Validation Memory too
                 del vids_val, press_val, curr_planes, h_val, full_rgb_p, full_target
+                del curr_planes_cold, h_val_cold, full_rgb_p_cold, full_target_cold # Cleanup Cold Start variables
+                
                 if str(device) == "mps":
                     torch.mps.empty_cache()
                 elif str(device) == "cuda":
                     torch.cuda.empty_cache()
                 gc.collect()
                     
-        avg_val_loss = val_loss / val_autoregressive_steps
-        avg_val_iou = val_iou / val_autoregressive_steps # Average the IoU over steps
+        # Protect against zero-division if validation sequences are too short
+        avg_val_loss = val_loss / max(1, val_autoregressive_steps)
+        avg_val_iou = val_iou / max(1, val_autoregressive_steps) # Average the IoU over steps
+        avg_val_cold_iou = val_cold_start_iou / max(1, val_cold_start_steps) # Average the Cold Start IoU
         
-        # Print and Log IoU to TensorBoard
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f} | Val IoU: {avg_val_iou:.4f}")
+        # Print and Log metrics to TensorBoard
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f} | Val IoU: {avg_val_iou:.4f} | Cold Start IoU: {avg_val_cold_iou:.4f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
         writer.add_scalar('Training/Validation_IoU', avg_val_iou, epoch + 1)
+        writer.add_scalar('Validation/Cold_Start_IoU', avg_val_cold_iou, epoch + 1) # NEW: Un-cheatable metric
+        
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
         # ==========================================
         # --- CHECKPOINT SAVING ---
         # ==========================================
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
+            
         checkpoint_dict = {
             'epoch': epoch + 1,
             'best_val_loss': best_val_loss,
@@ -449,12 +492,10 @@ def main():
             'decoder': decoder.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'scheduler_base_lrs': scheduler.base_lrs # Preserves LR decay
+            'scheduler_base_lrs': scheduler.base_lrs 
         }
         
-        # Save the best overall model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if is_best:
             torch.save(checkpoint_dict, os.path.join(log_dir, "best_model.pth"))
             print(f"*** New Best Model Saved (Val Loss: {best_val_loss:.6f}) ***")
 
@@ -462,7 +503,7 @@ def main():
         if (epoch + 1) % 50 == 0:
             torch.save(checkpoint_dict, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
             
-        # ALWAYS save the latest state so progress is never lost during sudden stops
+        # ALWAYS save the latest state
         torch.save(checkpoint_dict, os.path.join(log_dir, "last_checkpoint.pth"))
 
     writer.close()
