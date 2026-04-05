@@ -52,12 +52,11 @@ class TriPlaneDynamics(nn.Module):
         # ---------------------------------------------------------
         def build_attention_generator():
             return nn.Sequential(
-                # Looks at both the visual state and the raw action intent
-                # feature_dim (Visual) + action_embed_dim (Action) + feature_dim (History/Hysteresis)
-                nn.Conv2d((feature_dim * 2) + action_embed_dim, action_embed_dim, kernel_size=3, padding=1),
+                # feature_dim (Visual) + action_embed_dim (Action) + feature_dim (Memory) + 2 (X, Y Coords)
+                nn.Conv2d((feature_dim * 2) + action_embed_dim + 2, action_embed_dim, kernel_size=3, padding=1),
                 nn.LeakyReLU(0.2),
                 nn.Conv2d(action_embed_dim, action_embed_dim, kernel_size=3, padding=1),
-                nn.Sigmoid() # Squashes the mask smoothly between 0 (ignore) and 1 (apply)
+                nn.Sigmoid() 
             )
             
         self.attention_gen_xy = build_attention_generator()
@@ -74,6 +73,14 @@ class TriPlaneDynamics(nn.Module):
         # Separates the clamped hidden state memory from the unbounded visual features
         self.plane_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
 
+        # Pre-compute the 32x32 spatial coordinate grid and save it as a model buffer.
+        # This automatically moves to the correct device and prevents recreation overhead.
+        spatial_dim = 32
+        y_coords = torch.linspace(-1, 1, spatial_dim).view(1, 1, spatial_dim, 1).expand(1, 1, spatial_dim, spatial_dim)
+        x_coords = torch.linspace(-1, 1, spatial_dim).view(1, 1, 1, spatial_dim).expand(1, 1, spatial_dim, spatial_dim)
+        coord_grid = torch.cat([y_coords, x_coords], dim=1) # Shape: [1, 2, 32, 32]
+        self.register_buffer('coord_grid', coord_grid)
+
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
         B, C, H, W = tri_planes_t['xy'].shape
         
@@ -86,13 +93,16 @@ class TriPlaneDynamics(nn.Module):
         if hidden_states_prev is None:
             hidden_states_prev = {k: torch.tanh(self.h0_proj(v)) for k, v in tri_planes_t.items()}
         
-        # 3. HYSTERESIS-AWARE DYNAMIC MASKS
-        # The generator now looks at: Current Shape + Current Pressure + Physical Memory
-        mask_xy = self.attention_gen_xy(torch.cat([tri_planes_t['xy'], act_xy_base, hidden_states_prev['xy']], dim=1))
-        mask_xz = self.attention_gen_xz(torch.cat([tri_planes_t['xz'], act_xz_base, hidden_states_prev['xz']], dim=1))
-        mask_yz = self.attention_gen_yz(torch.cat([tri_planes_t['yz'], act_yz_base, hidden_states_prev['yz']], dim=1))
+        # Expand the pre-computed grid to match the current Batch size
+        batch_coords = self.coord_grid.expand(B, -1, -1, -1)
+        
+        # Step 3: HYSTERESIS-AWARE & SPATIALLY-ANCHORED DYNAMIC MASKS
+        # Now passing 162 channels: Visual(64) + Action(32) + Memory(64) + Coords(2)
+        mask_xy = self.attention_gen_xy(torch.cat([tri_planes_t['xy'], act_xy_base, hidden_states_prev['xy'], batch_coords], dim=1))
+        mask_xz = self.attention_gen_xz(torch.cat([tri_planes_t['xz'], act_xz_base, hidden_states_prev['xz'], batch_coords], dim=1))
+        mask_yz = self.attention_gen_yz(torch.cat([tri_planes_t['yz'], act_yz_base, hidden_states_prev['yz'], batch_coords  ], dim=1))
 
-        # 4. Apply Masks
+        # Step 4: Apply Masks
         act_xy = act_xy_base * mask_xy
         act_xz = act_xz_base * mask_xz
         act_yz = act_yz_base * mask_yz
