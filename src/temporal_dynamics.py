@@ -62,11 +62,13 @@ class TriPlaneDynamics(nn.Module):
         self.attention_gen_xz = build_attention_generator()
         self.attention_gen_yz = build_attention_generator()
 
-        # The input_dim is back to feature_dim because we are modulating, not concatenating
-        self.dynamics_rnn = ConvGRUCell(
-            input_dim=self.feature_dim, 
-            hidden_dim=self.feature_dim
-        )
+        # Split Dynamics Recurrence: Each plane gets its own dedicated GRU cell
+        # to prevent bottlenecking plane-specific physical momentum.
+        self.dynamics_grus = nn.ModuleDict({
+            'xy': ConvGRUCell(input_dim=self.feature_dim, hidden_dim=self.feature_dim),
+            'xz': ConvGRUCell(input_dim=self.feature_dim, hidden_dim=self.feature_dim),
+            'yz': ConvGRUCell(input_dim=self.feature_dim, hidden_dim=self.feature_dim)
+        })
 
         self.h0_proj = nn.Conv2d(self.feature_dim, self.feature_dim, kernel_size=1)
         
@@ -116,8 +118,8 @@ class TriPlaneDynamics(nn.Module):
         hidden_states_new = {}
         
         for plane_key in ['xy', 'xz', 'yz']:
-            # The GRU now only takes the modulated features
-            h_new = self.dynamics_rnn(plane_mods[plane_key], hidden_states_prev[plane_key])
+            # The specific plane's GRU now processes the modulated features
+            h_new = self.dynamics_grus[plane_key](plane_mods[plane_key], hidden_states_prev[plane_key])
             
             # Residual Prediction
             # The network ONLY predicts the deformation (delta), which is added to the current frame.
