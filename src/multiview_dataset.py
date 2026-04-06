@@ -89,7 +89,9 @@ class SoftRobotDataset(Dataset):
             # 2. LOAD THE VIDEOS
             views = ["ViewSide1", "ViewSide2", "ViewSide3", "ViewTop"]
             all_views_frames = []
-            num_frames_in_video = 0
+            
+            # Keep track of how many frames each camera actually captured
+            view_frame_counts = []
             
             for view_name in views:
                 video_path = glob.glob(os.path.join(case_folder, f"*{view_name}.avi"))[0]
@@ -145,12 +147,22 @@ class SoftRobotDataset(Dataset):
                 cap.release()
                 video_tensor = torch.tensor(np.array(frames)) # [Time, 1, 128, 128]
                 all_views_frames.append(video_tensor)
-                num_frames_in_video = len(frames)
+                
+                # Save the frame count for this specific view
+                view_frame_counts.append(len(frames))
+                
+            # Find the shortest video stream to prevent torch.stack from crashing if a camera dropped a frame
+            min_frames = min(view_frame_counts)
+            if len(set(view_frame_counts)) > 1:
+                all_views_frames = [v[:min_frames] for v in all_views_frames]
                 
             videos = torch.stack(all_views_frames, dim=1) # [Time, Views, C, H, W]
             
             # 3. ALIGN TIME & STRICT NORMALIZATION
-            aligned_pressures = pressures_kpa[-num_frames_in_video:]
+            # Ensure CSV is long enough to match the videos (If not, we will trim the videos to match the CSV length)
+            final_len = min(min_frames, pressures_kpa.shape[0])
+            videos = videos[:final_len]
+            aligned_pressures = pressures_kpa[-final_len:]
             
             # Convert kPa to Pa to accurately map the physical values
             aligned_pressures_pa = aligned_pressures * 1000.0
