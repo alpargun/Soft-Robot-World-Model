@@ -65,7 +65,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/4_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/3_splitRNNs_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -216,6 +216,11 @@ def main():
             batch_sequence_loss = 0.0
             autoregressive_steps = 0
             
+            # Trajectory-Level Action Augmentation
+            # Generates a single, smooth offset applied to the entire pressure sequence to simulate 
+            # realistic sensor miscalibration/hysteresis drift, replacing the unrealistic frame-by-frame jitter.
+            sequence_action_noise = (torch.rand(B, 3, device=device) - 0.5) * 0.05
+            
             # ==========================================
             # --- DYNAMIC BURN-IN SELECTION ---
             # ==========================================
@@ -244,10 +249,9 @@ def main():
             # ==========================================
             for t in range(current_burn_in - 1, Time - 1):
                 
-                # Action jittering: Adds small random noise to the pressures to prevent overfitting to exact values 
+                # Apply the trajectory-level augmentation globally to the step
                 base_action = pressures[:, t]
-                action_noise = (torch.rand_like(base_action) - 0.5) * 0.05
-                action_t = torch.clamp(base_action + action_noise, min=0.00001, max=1.0)
+                action_t = torch.clamp(base_action + sequence_action_noise, min=0.00001, max=1.0)
                 frames_next_true = videos[:, t+1] 
                 
                 # Predict the next latent state
