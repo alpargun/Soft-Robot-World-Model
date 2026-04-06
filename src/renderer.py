@@ -108,12 +108,12 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
         kernel = torch.ones(1, 1, 3, 3, device=device)
         
         for b in range(B):
-            # Isolate the current batch item and add dummy batch/channel dims for F.conv2d
-            curr_mask = view_mask[b].unsqueeze(0).unsqueeze(0).float()
+            # Force the soft mask to a hard binary mask just for the mathematical extraction
+            curr_mask_binary = (view_mask[b].unsqueeze(0).unsqueeze(0) > 0.5).float()
             
             # Morphological Gradient (Dilate - Erode) to find the boundary
-            dilated = F.conv2d(curr_mask, kernel, padding=1) > 0.0
-            eroded = F.conv2d(curr_mask, kernel, padding=1) == 9.0
+            dilated = F.conv2d(curr_mask_binary, kernel, padding=1) > 0.0
+            eroded = F.conv2d(curr_mask_binary, kernel, padding=1) == 9.0
             boundary_mask = (dilated.float() - eroded.float()).squeeze() > 0.5
             
             # STRICT REGION SEGREGATION
