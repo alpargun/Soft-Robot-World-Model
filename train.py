@@ -65,7 +65,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/3_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/4_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -155,9 +155,7 @@ def main():
 
     # 4. Optimizer Setup
     all_params = list(encoder.parameters()) + list(dynamics.parameters()) + list(decoder.parameters())
-    
     optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-6) # AdamW decouples weight decay from grad update
-    
     # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
@@ -189,9 +187,11 @@ def main():
     # Define Loss Functions
     # Initialize with reduction='none' so it outputs per-pixel losses
     bce_loss_fn = nn.BCELoss(reduction='none') # Use BCE instead of L1 for sharper edges
+    l1_loss_fn = nn.L1Loss() # for Latent Consistency
 
     # 5. The Training Loop
     for epoch in range(start_epoch, NUM_EPOCHS):
+
         encoder.train()
         dynamics.train()
         decoder.train()
@@ -206,15 +206,11 @@ def main():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
             videos = batch["video"].to(device)       
             pressures = batch["pressures"].to(device) # Pressures are pre-normalized by Dataset!
-            
             B, Time, Views, C, H, W = videos.shape 
             
             optimizer.zero_grad()
-            
             hidden_state = None 
-            
-            # Establish the initial visual state
-            current_tri_planes = encoder(videos[:, 0])
+            current_tri_planes = encoder(videos[:, 0]) # Establish the initial visual state
 
             # Trackers for the Autoregressive Phase
             batch_sequence_loss = 0.0
@@ -249,15 +245,22 @@ def main():
             for t in range(current_burn_in - 1, Time - 1):
                 
                 # Action jittering: Adds small random noise to the pressures to prevent overfitting to exact values 
-                # and encourage learning of smooth dynamics. 
                 base_action = pressures[:, t]
                 action_noise = (torch.rand_like(base_action) - 0.5) * 0.05
                 action_t = torch.clamp(base_action + action_noise, min=0.00001, max=1.0)
-                
                 frames_next_true = videos[:, t+1] 
                 
-                # Predict the next 3D state ENTIRELY BLIND
+                # Predict the next latent state
                 planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
+
+                # --- LATENT CONSISTENCY ---
+                # Encode the actual next frame to see where the dynamics "should" have landed
+                with torch.no_grad(): # we don't want to accidentally train the encoder to cheat
+                    planes_next_real = encoder(frames_next_true)
+
+                latent_loss = 0.0
+                for pk in ['xy', 'xz', 'yz']:
+                    latent_loss += l1_loss_fn(planes_next_pred[pk], planes_next_real[pk])
                 
                 # Render the current frame
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
@@ -267,7 +270,7 @@ def main():
                 # 1. Combined BCE and Dice Loss (Shape: [B])
                 raw_bce = bce_loss_fn(rgb_pred, target_rgb)
                 loss_bce = raw_bce.view(B, -1).mean(dim=1) 
-                
+
                 loss_dice = dice_loss_per_batch(rgb_pred, target_rgb)
                 
                 # 2. 3D Sparsity Loss (Shape: [B])
@@ -276,19 +279,14 @@ def main():
                 eps = 1e-6
                 entropy = -random_probs * torch.log(random_probs + eps) - (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
                 sparsity_loss = entropy.view(B, -1).mean(dim=1) # Average entropy per batch item
-                lambda_sparse = 0.005
                 
                 # ==========================================
-                # --- PER-SAMPLE ACTION WEIGHTING ---
+                # --- LOSS AGGREGATION & LATENT ANCHORING ---
                 # ==========================================
-                # Calculate the max pressure for each specific video in the batch. Shape: [B]
-                pressure_magnitude = torch.max(action_t, dim=1)[0]
-                
-                # Each batch item gets its own exact multiplier. Shape: [B]
-                loss_multiplier = 1.0 + (3.0 * pressure_magnitude)
-                
-                # Sum the isolated losses, apply the specific multiplier, then reduce to a scalar
-                step_loss = ((loss_bce + loss_dice + (lambda_sparse * sparsity_loss)) * loss_multiplier).mean()
+                # We use a high lambda (10.0) for Latent Consistency because L1 distances in 
+                # the bounded [-1, 1] feature space are numerically tiny compared to pixel-level BCE/Dice.
+                lambda_latent = 10.0 # Increased weight on latent consistency to force better dynamics learning
+                step_loss = (loss_bce + loss_dice + (0.005 * sparsity_loss) + (lambda_latent * latent_loss)).mean()
                 
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
