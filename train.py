@@ -64,7 +64,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/3_splitRNNs_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/4_renderingFix_splitRNNs_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -235,7 +235,7 @@ def main():
             # --- PHASE 1: BURN-IN ---
             # ==========================================
             for t in range(current_burn_in - 1):
-                action_t = torch.clamp(pressures[:, t] + sequence_action_noise, min=0.00001, max=1.0)
+                action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
                 
                 # Step the physics engine to build memory
                 _, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
@@ -286,9 +286,7 @@ def main():
                 # ==========================================
                 # --- LOSS AGGREGATION & LATENT ANCHORING ---
                 # ==========================================
-                # We use a high lambda (10.0) for Latent Consistency because L1 distances in 
-                # the bounded [-1, 1] feature space are numerically tiny compared to pixel-level BCE/Dice.
-                lambda_latent = 10.0 # Increased weight on latent consistency to force better dynamics learning
+                lambda_latent = 5.0 # Weight for latent consistency
                 step_loss = (loss_bce + loss_dice + (0.005 * sparsity_loss) + (lambda_latent * latent_loss)).mean()
                 
                 batch_sequence_loss += step_loss
