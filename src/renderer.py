@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class VolumetricRayMarcher(nn.Module):
     def __init__(self, num_samples=64):
@@ -92,50 +93,63 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
         dirs = torch.zeros(B, samples_per_view, 3, device=device)
         
         # 1. Generate continuous pixel coordinates between [-1, 1] based on mode
-        if image_mode == "rgb":
-            # PATCH SAMPLING: Grab a random contiguous 16x16 square for LPIPS
-            patch_dim = int(math.sqrt(samples_per_view))
-            start_x = torch.randint(0, W - patch_dim, (B,), device=device)
-            start_y = torch.randint(0, H - patch_dim, (B,), device=device)
+        # === BOUNDARY-FOCUSED SAMPLING ===
+        num_bound = int(samples_per_view * 0.40) # 40% Boundary
+        num_fg = int(samples_per_view * 0.40)    # 40% Foreground
+        num_bg = samples_per_view - num_bound - num_fg # 20% Background
+        
+        u_idx = torch.zeros(B, samples_per_view, device=device, dtype=torch.long)
+        v_idx = torch.zeros(B, samples_per_view, device=device, dtype=torch.long)
+        
+        # Get the view mask (just channel 0 to find the robot shape)
+        view_mask = target_frames[:, v, 0, :, :] 
+        
+        # Create a 3x3 kernel for morphological operations
+        kernel = torch.ones(1, 1, 3, 3, device=device)
+        
+        for b in range(B):
+            # Isolate the current batch item and add dummy batch/channel dims for F.conv2d
+            curr_mask = view_mask[b].unsqueeze(0).unsqueeze(0).float()
             
-            y_grid, x_grid = torch.meshgrid(torch.arange(patch_dim, device=device), 
-                                            torch.arange(patch_dim, device=device), indexing='ij')
+            # Morphological Gradient (Dilate - Erode) to find the boundary
+            dilated = F.conv2d(curr_mask, kernel, padding=1) > 0.0
+            eroded = F.conv2d(curr_mask, kernel, padding=1) == 9.0
+            boundary_mask = (dilated.float() - eroded.float()).squeeze() > 0.5
             
-            u_idx = start_x.unsqueeze(1) + x_grid.flatten().unsqueeze(0) # [B, 256]
-            v_idx = start_y.unsqueeze(1) + y_grid.flatten().unsqueeze(0) # [B, 256]
+            # STRICT REGION SEGREGATION
+            bound_coords = torch.nonzero(boundary_mask)
+            fg_coords = torch.nonzero((view_mask[b] > 0.5) & ~boundary_mask)
+            bg_coords = torch.nonzero((view_mask[b] <= 0.5) & ~boundary_mask) # Strict background excludes boundary
             
-            u = (u_idx.float() / (W - 1)) * 2.0 - 1.0
-            v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
-            
-        else:
-            # === THE FIX: FOREGROUND-BIASED SAMPLING ===
-            num_fg = samples_per_view // 2  # 50% of rays MUST hit the robot
-            num_bg = samples_per_view - num_fg
-            
-            u_idx = torch.zeros(B, samples_per_view, device=device, dtype=torch.long)
-            v_idx = torch.zeros(B, samples_per_view, device=device, dtype=torch.long)
-            
-            # Get the view mask (just channel 0 to find the robot shape)
-            view_mask = target_frames[:, v, 0, :, :] 
-            
-            for b in range(B):
-                # Find coordinates where the mask is white (> 0.5)
-                fg_coords = torch.nonzero(view_mask[b] > 0.5) 
+            # --- Sample Boundary (40%) ---
+            if len(bound_coords) > 0:
+                rand_idx = torch.randint(0, len(bound_coords), (num_bound,))
+                chosen = bound_coords[rand_idx]
+                v_idx[b, :num_bound] = chosen[:, 0]
+                u_idx[b, :num_bound] = chosen[:, 1]
+            else: 
+                v_idx[b, :num_bound] = torch.randint(0, H, (num_bound,), device=device)
+                u_idx[b, :num_bound] = torch.randint(0, W, (num_bound,), device=device)
                 
-                if len(fg_coords) > 0:
-                    # Randomly pick from the foreground (the robot)
-                    rand_fg_indices = torch.randint(0, len(fg_coords), (num_fg,))
-                    chosen_fg = fg_coords[rand_fg_indices]
-                    v_idx[b, :num_fg] = chosen_fg[:, 0]
-                    u_idx[b, :num_fg] = chosen_fg[:, 1]
-                else:
-                    # Fallback if the frame is completely empty (rare)
-                    v_idx[b, :num_fg] = torch.randint(0, H, (num_fg,), device=device)
-                    u_idx[b, :num_fg] = torch.randint(0, W, (num_fg,), device=device)
-                    
-                # Randomly pick background/global points for the remaining 50%
-                v_idx[b, num_fg:] = torch.randint(0, H, (num_bg,), device=device)
-                u_idx[b, num_fg:] = torch.randint(0, W, (num_bg,), device=device)
+            # --- Sample Foreground (40%) ---
+            if len(fg_coords) > 0:
+                rand_idx = torch.randint(0, len(fg_coords), (num_fg,))
+                chosen = fg_coords[rand_idx]
+                v_idx[b, num_bound:num_bound+num_fg] = chosen[:, 0]
+                u_idx[b, num_bound:num_bound+num_fg] = chosen[:, 1]
+            else: 
+                v_idx[b, num_bound:num_bound+num_fg] = torch.randint(0, H, (num_fg,), device=device)
+                u_idx[b, num_bound:num_bound+num_fg] = torch.randint(0, W, (num_fg,), device=device)
+                
+            # --- Sample Strict Background (20%) ---
+            if len(bg_coords) > 0:
+                rand_idx = torch.randint(0, len(bg_coords), (num_bg,))
+                chosen = bg_coords[rand_idx]
+                v_idx[b, num_bound+num_fg:] = chosen[:, 0]
+                u_idx[b, num_bound+num_fg:] = chosen[:, 1]
+            else:
+                v_idx[b, num_bound+num_fg:] = torch.randint(0, H, (num_bg,), device=device)
+                u_idx[b, num_bound+num_fg:] = torch.randint(0, W, (num_bg,), device=device)
                 
             u = (u_idx.float() / (W - 1)) * 2.0 - 1.0
             v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
