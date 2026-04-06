@@ -3,7 +3,6 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 from datetime import datetime
 import random
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -163,9 +162,9 @@ def main():
     best_val_loss = float('inf')
     start_epoch = 0
     if os.path.exists(RESUME_CHECKPOINT_PATH):
-        print(f"=================================================")
+        print("=================================================")
         print(f"RESUMING TRAINING FROM: {RESUME_CHECKPOINT_PATH}")
-        print(f"=================================================")
+        print("=================================================")
         checkpoint = torch.load(RESUME_CHECKPOINT_PATH, map_location=device)
         
         # 1. Load Model Weights
@@ -233,10 +232,10 @@ def main():
                 current_burn_in = 1
             
             # ==========================================
-            # --- PHASE 1: THE BURN-IN ---
+            # --- PHASE 1: BURN-IN ---
             # ==========================================
             for t in range(current_burn_in - 1):
-                action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
+                action_t = torch.clamp(pressures[:, t] + sequence_action_noise, min=0.00001, max=1.0)
                 
                 # Step the physics engine to build memory
                 _, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
@@ -313,10 +312,14 @@ def main():
                 optimizer.step()
                 
                 epoch_loss += batch_sequence_loss.item()
+
+                # delete autoregressive variables only if they were created
+                del ray_origins, ray_dirs, target_rgb, rgb_pred, planes_next_pred, step_loss
             
-            # --- AGGRESSIVE MEMORY CLEANUP FOR MACS ---
-            # Deleting these heavy tensors and explicitly clearing the cache prevents fragmentation crashes
-            del videos, pressures, ray_origins, ray_dirs, target_rgb, rgb_pred, planes_next_pred, current_tri_planes, batch_sequence_loss, step_loss
+            # --- MEMORY CLEANUP ---
+            # These variables are guaranteed to exist regardless of sequence length
+            del videos, pressures, current_tri_planes, batch_sequence_loss
+            
             if str(device) == "mps":
                 torch.mps.empty_cache()
             elif str(device) == "cuda":
