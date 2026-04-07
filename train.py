@@ -9,7 +9,6 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-import gc
 
 # Import custom modules
 from src.multiview_dataset import SoftRobotDataset
@@ -46,7 +45,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/5_lossCoefs_renderingFix_splitRNNs_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/7_sharedGRUmultipleHead_removeTF_lossCoefs_renderingFix_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
