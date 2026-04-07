@@ -32,24 +32,6 @@ def dice_loss_per_batch(pred, target, smooth=1e-5):
     
     return 1.0 - dice_coeff # Returns a tensor of shape [B]
 
-def calculate_iou(pred, target, threshold=0.5):
-    """
-    Calculates the Intersection over Union (IoU) for binary masks.
-    Ignores the background and strictly grades the silhouette shape.
-    """
-    # Convert soft predictions and targets to hard binary masks
-    pred_bin = (pred > threshold).float()
-    target_bin = (target > 0.5).float()
-    
-    # Calculate intersection and union over the spatial/channel dimensions
-    intersection = (pred_bin * target_bin).sum(dim=[1, 2]) 
-    union = pred_bin.sum(dim=[1, 2]) + target_bin.sum(dim=[1, 2]) - intersection
-    
-    # Avoid division by zero
-    iou = (intersection + 1e-6) / (union + 1e-6)
-    
-    return iou.mean() # Return the batch average
-
 def main():
     
     # 1. Configuration
@@ -347,10 +329,7 @@ def main():
         dynamics.eval()
         decoder.eval()
         val_loss = 0.0
-        val_iou = 0.0
-        val_cold_start_iou = 0.0 # Tracks absolute Open-Loop performance
         val_autoregressive_steps = 0
-        val_cold_start_steps = 0 # Tracks steps for the cold start evaluation
         
         with torch.no_grad():
             for val_batch_idx, batch in enumerate(val_loader):
@@ -391,18 +370,6 @@ def main():
                     val_loss += val_step_loss.item()
                     val_autoregressive_steps += 1
                     
-                    # Full Image IoU Calculation
-                    # We render the full image for view 0 (Side 1) to get an accurate IoU metric without slowing down validation too much.
-                    full_ray_o, full_ray_d = get_full_image_rays(H, W, view_idx=0, device=device)
-                    full_ray_o = full_ray_o.unsqueeze(0).expand(B_val, -1, -1)
-                    full_ray_d = full_ray_d.unsqueeze(0).expand(B_val, -1, -1)
-                    
-                    full_rgb_p = render_rays_chunked(ray_marcher, decoder, pred_planes, full_ray_o, full_ray_d, chunk_size=4096)
-                    full_target = vids_val[:, t+1, 0].permute(0, 2, 3, 1).reshape(B_val, H*W, 1)
-
-                    # Calculate IoU directly on the flat rays
-                    val_iou += calculate_iou(full_rgb_p, full_target).item()
-
                     # ---------------------------------------------------------
                     # VALIDATION VISUALIZATION BLOCK
                     # ---------------------------------------------------------
@@ -429,35 +396,8 @@ def main():
                     
                     curr_planes = pred_planes
                 
-                # ---------------------------------------------------------
-                # --- COLD START EVALUATION (NO BURN-IN) ---
-                # ---------------------------------------------------------
-                # The network is forced to simulate the entire sequence starting 
-                # strictly from t=0, making it impossible to cheat using visual momentum.
-                curr_planes_cold = encoder(vids_val[:, 0])
-                h_val_cold = None
-                
-                for t in range(V_Time - 1):
-                    action_val_clamped = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
-                    
-                    pred_planes_cold, h_val_cold = dynamics(curr_planes_cold, action_val_clamped, h_val_cold)
-                    
-                    # Full Image IoU Calculation for view 0
-                    full_ray_o_cold, full_ray_d_cold = get_full_image_rays(H, W, view_idx=0, device=device)
-                    full_ray_o_cold = full_ray_o_cold.unsqueeze(0).expand(B_val, -1, -1)
-                    full_ray_d_cold = full_ray_d_cold.unsqueeze(0).expand(B_val, -1, -1)
-                    
-                    full_rgb_p_cold = render_rays_chunked(ray_marcher, decoder, pred_planes_cold, full_ray_o_cold, full_ray_d_cold, chunk_size=4096)
-                    full_target_cold = vids_val[:, t+1, 0].permute(0, 2, 3, 1).reshape(B_val, H*W, 1)
-
-                    val_cold_start_iou += calculate_iou(full_rgb_p_cold, full_target_cold).item()
-                    val_cold_start_steps += 1
-                    
-                    curr_planes_cold = pred_planes_cold
-
                 # Clean up Validation Memory too
-                del vids_val, press_val, curr_planes, h_val, full_rgb_p, full_target
-                del curr_planes_cold, h_val_cold, full_rgb_p_cold, full_target_cold # Cleanup Cold Start variables
+                del vids_val, press_val, curr_planes, h_val
                 
                 if str(device) == "mps":
                     torch.mps.empty_cache()
@@ -467,15 +407,11 @@ def main():
                     
         # Protect against zero-division if validation sequences are too short
         avg_val_loss = val_loss / max(1, val_autoregressive_steps)
-        avg_val_iou = val_iou / max(1, val_autoregressive_steps) # Average the IoU over steps
-        avg_val_cold_iou = val_cold_start_iou / max(1, val_cold_start_steps) # Average the Cold Start IoU
         
         # Print and Log metrics to TensorBoard
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f} | Val IoU: {avg_val_iou:.4f} | Cold Start IoU: {avg_val_cold_iou:.4f}")
+        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
-        writer.add_scalar('Training/Validation_IoU', avg_val_iou, epoch + 1)
-        writer.add_scalar('Validation/Cold_Start_IoU', avg_val_cold_iou, epoch + 1) # NEW: Un-cheatable metric
         
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
