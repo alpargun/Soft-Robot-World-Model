@@ -64,7 +64,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/4_renderingFix_splitRNNs_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/5_lossCoefs_renderingFix_splitRNNs_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -154,9 +154,9 @@ def main():
 
     # 4. Optimizer Setup
     all_params = list(encoder.parameters()) + list(dynamics.parameters()) + list(decoder.parameters())
-    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-6) # AdamW decouples weight decay from grad update
+    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-4) # AdamW decouples weight decay from grad update
     # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=150, T_mult=1, eta_min=1e-6)
     
     # --- RESUME CHECKPOINT ---
     best_val_loss = float('inf')
@@ -221,15 +221,16 @@ def main():
             sequence_action_noise = (torch.rand(B, 3, device=device) - 0.5) * 0.05
             
             # ==========================================
-            # --- DYNAMIC BURN-IN SELECTION ---
+            # --- CONDITIONAL BURN-IN SELECTION ---
             # ==========================================
-            # 50% of the time, we force a "Cold Start". The network gets NO 
-            # visual momentum history and must learn to break static inertia 
-            # and map pressure to movement from a dead stop.
-            if random.random() < 0.50:
-                current_burn_in = BURN_IN_LENGTH
-            else:
+            # 1. Check if the sequence starts from a true physical resting state.
+            is_resting_start = torch.max(pressures[:, 0]).item() < 0.01
+            
+            # 2. Only allow Cold Starts if the robot is actually at rest.
+            if is_resting_start and random.random() < 0.50:
                 current_burn_in = 1
+            else:
+                current_burn_in = BURN_IN_LENGTH
             
             # ==========================================
             # --- PHASE 1: BURN-IN ---
@@ -284,15 +285,17 @@ def main():
                 sparsity_loss = entropy.view(B, -1).mean(dim=1) # Average entropy per batch item
                 
                 # ==========================================
-                # --- LOSS AGGREGATION & LATENT ANCHORING ---
+                # --- CALCULATE LOSS ---
                 # ==========================================
                 lambda_latent = 5.0 # Weight for latent consistency
-                step_loss = (loss_bce + loss_dice + (0.005 * sparsity_loss) + (lambda_latent * latent_loss)).mean()
+                lambda_sparsity = 0.05 # Weight for sparsity regularization (tuned to prevent over-sparsification)
+                lambda_dice = 2.0 # Weight for Dice loss to ensure shape accuracy
+                step_loss = (loss_bce + (lambda_dice * loss_dice) + (lambda_sparsity * sparsity_loss) + (lambda_latent * latent_loss)).mean()
                 
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
-                # --- SCHEDULED SAMPLING FEEDBACK ---
+                # --- SCHEDULED SAMPLING ---
                 if random.random() < teacher_forcing_ratio:
                     # Provide the real previous frame to prevent early gradient panic
                     current_tri_planes = encoder(frames_next_true)
@@ -328,8 +331,7 @@ def main():
         scheduler.step()
 
         # --- DECAYING PEAK LR LOGIC ---
-        restart_epochs = [50, 150, 350] # The T_0=50, T_mult=2 schedule restarts at epochs 50, 150, and 350.
-        if (epoch + 1) in restart_epochs:
+        if (epoch + 1) % 150 == 0: # Every 150 epochs, apply a warm restart with a decayed peak learning rate
             for param_group in optimizer.param_groups:
                 if 'initial_lr' in param_group:
                     param_group['initial_lr'] *= 0.5 # Cut the maximum learning rate in half at each restart.
