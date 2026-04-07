@@ -63,7 +63,6 @@ def main():
     RAYS_PER_STEP = 256 # Number of rays to sample per time step for loss calculation
     
     BURN_IN_LENGTH = 5 
-    TF_UNTIL = 100.0 # Number of epochs to apply teacher forcing. After this, it decays to 0.
     VAL_PERCENTAGE = 0.15 # Percentage of pure bending cases to hold out for validation
 
     # Check for GPU availability
@@ -178,10 +177,6 @@ def main():
         decoder.train()
         
         epoch_loss = 0.0
-
-        # Start with 100% Teacher Forcing, decaying smoothly to 0% by Epoch 150
-        teacher_forcing_ratio = max(0.0, 1.0 - (epoch / TF_UNTIL))
-        writer.add_scalar('Training/Teacher_Forcing_Ratio', teacher_forcing_ratio, epoch)
         
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
@@ -223,7 +218,7 @@ def main():
                 # Step the physics engine to build memory
                 _, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
                 
-                # Force the visual state to reality (Teacher Forcing) for the next step
+                # Force the visual state to reality for the next step
                 current_tri_planes = encoder(videos[:, t+1])
                 
             # ==========================================
@@ -277,13 +272,10 @@ def main():
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
-                # --- SCHEDULED SAMPLING ---
-                if random.random() < teacher_forcing_ratio:
-                    # Provide the real previous frame to prevent early gradient panic
-                    current_tri_planes = encoder(frames_next_true)
-                else:
-                    # Strict Autoregression: Feed our own prediction back
-                    current_tri_planes = {k: v for k, v in planes_next_pred.items()}
+                # --- STRICT AUTOREGRESSION ---
+                # Feed our own prediction back into the network. 
+                # We rely entirely on Latent Consistency Loss to keep us grounded to reality.
+                current_tri_planes = {k: v for k, v in planes_next_pred.items()}
 
             # We only average the loss over the steps we actually predicted
             if autoregressive_steps > 0:
@@ -302,12 +294,6 @@ def main():
             # --- MEMORY CLEANUP ---
             # These variables are guaranteed to exist regardless of sequence length
             del videos, pressures, current_tri_planes, batch_sequence_loss
-            
-            if str(device) == "mps":
-                torch.mps.empty_cache()
-            elif str(device) == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
             
         # Step the learning rate down appropriately per epoch
         scheduler.step()
@@ -398,12 +384,6 @@ def main():
                 
                 # Clean up Validation Memory too
                 del vids_val, press_val, curr_planes, h_val
-                
-                if str(device) == "mps":
-                    torch.mps.empty_cache()
-                elif str(device) == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
                     
         # Protect against zero-division if validation sequences are too short
         avg_val_loss = val_loss / max(1, val_autoregressive_steps)
