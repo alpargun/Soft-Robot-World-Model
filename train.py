@@ -45,7 +45,7 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/7_sharedGRUmultipleHead_removeTF_lossCoefs_renderingFix_latentConsist_spatialFiLM_residualPred_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/9_resNet_curriculum_lossWarmup_sharedGRU_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -59,7 +59,7 @@ def main():
     FRAME_STRIDE = 2 # Skip every other frame to force learning of dynamics, not just memorization.
     SEQUENCE_LENGTH = 24
     FEATURE_DIM = 64
-    RAYS_PER_STEP = 256 # Number of rays to sample per time step for loss calculation
+    RAYS_PER_STEP = 512 # Number of rays to sample per time step for loss calculation
     
     BURN_IN_LENGTH = 5 
     VAL_PERCENTAGE = 0.15 # Percentage of pure bending cases to hold out for validation
@@ -194,7 +194,9 @@ def main():
             # Trajectory-Level Action Augmentation
             # Generates a single, smooth offset applied to the entire pressure sequence to simulate 
             # realistic sensor miscalibration/hysteresis drift, replacing the unrealistic frame-by-frame jitter.
-            sequence_action_noise = (torch.rand(B, 3, device=device) - 0.5) * 0.05
+            # Scales down from 5% noise to 1% noise by Epoch 300
+            current_noise_scale = max(0.01, 0.05 - (epoch / 300.0) * 0.04)
+            sequence_action_noise = (torch.rand(B, 3, device=device) - 0.5) * current_noise_scale
             
             # ==========================================
             # --- CONDITIONAL BURN-IN SELECTION ---
@@ -221,9 +223,12 @@ def main():
                 current_tri_planes = encoder(videos[:, t+1])
                 
             # ==========================================
-            # --- PHASE 2: AUTOREGRESSION ---
+            # --- PHASE 2: AUTOREGRESSION (CURRICULUM) ---
             # ==========================================
-            for t in range(current_burn_in - 1, Time - 1):
+            # Start with 2 predicted frames, add 2 more every 10 epochs, capped at the sequence length
+            max_allowed_steps = min(Time - current_burn_in, 2 + (epoch // 10) * 2)
+            
+            for t in range(current_burn_in - 1, current_burn_in - 1 + max_allowed_steps):
                 
                 # Apply the trajectory-level augmentation globally to the step
                 base_action = pressures[:, t]
@@ -263,9 +268,14 @@ def main():
                 # ==========================================
                 # --- CALCULATE LOSS ---
                 # ==========================================
-                lambda_latent = 5.0 # Weight for latent consistency
-                lambda_sparsity = 0.05 # Weight for sparsity regularization (tuned to prevent over-sparsification)
-                lambda_dice = 2.0 # Weight for Dice loss to ensure shape accuracy
+                # Consistency Loss: Decays from 5.0 to 1.0 over 150 epochs
+                lambda_latent = max(1.0, 5.0 - (epoch / 150.0) * 4.0) 
+                
+                # Add warmup: Ramps up losses over time
+                warmup_ratio = min(1.0, epoch / 100.0) # Hits 1.0 at Epoch 100
+                lambda_sparsity = 0.05 + (0.10 * warmup_ratio) # Scales from 0.05 to 0.15
+                lambda_dice = 2.0 + (1.0 * warmup_ratio)       # Scales from 2.0 to 3.0
+                
                 step_loss = (loss_bce + (lambda_dice * loss_dice) + (lambda_sparsity * sparsity_loss) + (lambda_latent * latent_loss)).mean()
                 
                 batch_sequence_loss += step_loss
