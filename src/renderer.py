@@ -151,8 +151,8 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
                 v_idx[b, num_bound+num_fg:] = torch.randint(0, H, (num_bg,), device=device)
                 u_idx[b, num_bound+num_fg:] = torch.randint(0, W, (num_bg,), device=device)
                 
-            u = (u_idx.float() / (W - 1)) * 2.0 - 1.0
-            v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
+        u = (u_idx.float() / (W - 1)) * 2.0 - 1.0
+        v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
         
         # 2. Map coordinates based on strict ANSYS camera positions
         if v == 0: # Side 1 (Camera at +X, looking at -X)
