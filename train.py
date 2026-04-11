@@ -3,12 +3,14 @@ import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 from datetime import datetime
 import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import gc
 
 # Import custom modules
 from src.multiview_dataset import SoftRobotDataset
@@ -45,7 +47,8 @@ def main():
 
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = f"runs/9_resNet_curriculum_lossWarmup_sharedGRU_{IMAGE_MODE.upper()}_{timestamp}"
+
+    log_dir = f"runs/revert_1_spatialAttention_pureAR_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -59,7 +62,7 @@ def main():
     FRAME_STRIDE = 2 # Skip every other frame to force learning of dynamics, not just memorization.
     SEQUENCE_LENGTH = 24
     FEATURE_DIM = 64
-    RAYS_PER_STEP = 512 # Number of rays to sample per time step for loss calculation
+    RAYS_PER_STEP = 256 # Number of rays to sample per time step for loss calculation
     
     BURN_IN_LENGTH = 5 
     VAL_PERCENTAGE = 0.15 # Percentage of pure bending cases to hold out for validation
@@ -120,21 +123,20 @@ def main():
     val_dataset = Subset(val_base, val_indices)
     print(f"Data Split -> Training Cases: {len(train_dataset)} | Validation Cases: {len(val_dataset)}")
     
-    dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    if len(dataloader) == 0:
-        raise ValueError("Training dataloader is empty! Check your DATA_DIRS and split logic.")
 
     # 3. Initialize Model Components
     encoder = TriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
-    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3).to(device)
+    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=32).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
 
     # 4. Optimizer Setup
     all_params = list(encoder.parameters()) + list(dynamics.parameters()) + list(decoder.parameters())
-    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-4) # AdamW decouples weight decay from grad update
+    
+    optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-6) # AdamW decouples weight decay from grad update
+    
     # Cosine Annealing with Warm Restarts: T_0 is first cycle length, T_mult multiplies the cycle length after restarts
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=150, T_mult=1, eta_min=1e-6)
     
@@ -166,11 +168,9 @@ def main():
     # Define Loss Functions
     # Initialize with reduction='none' so it outputs per-pixel losses
     bce_loss_fn = nn.BCELoss(reduction='none') # Use BCE instead of L1 for sharper edges
-    l1_loss_fn = nn.L1Loss() # for Latent Consistency
 
     # 5. The Training Loop
     for epoch in range(start_epoch, NUM_EPOCHS):
-
         encoder.train()
         dynamics.train()
         decoder.train()
@@ -181,37 +181,33 @@ def main():
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
             videos = batch["video"].to(device)       
             pressures = batch["pressures"].to(device) # Pressures are pre-normalized by Dataset!
+            
             B, Time, Views, C, H, W = videos.shape 
             
             optimizer.zero_grad()
+            
             hidden_state = None 
-            current_tri_planes = encoder(videos[:, 0]) # Establish the initial visual state
+            
+            # Establish the initial visual state
+            current_tri_planes = encoder(videos[:, 0])
 
             # Trackers for the Autoregressive Phase
             batch_sequence_loss = 0.0
             autoregressive_steps = 0
             
-            # Trajectory-Level Action Augmentation
-            # Generates a single, smooth offset applied to the entire pressure sequence to simulate 
-            # realistic sensor miscalibration/hysteresis drift, replacing the unrealistic frame-by-frame jitter.
-            # Scales down from 5% noise to 1% noise by Epoch 300
-            current_noise_scale = max(0.01, 0.05 - (epoch / 300.0) * 0.04)
-            sequence_action_noise = (torch.rand(B, 3, device=device) - 0.5) * current_noise_scale
-            
             # ==========================================
-            # --- CONDITIONAL BURN-IN SELECTION ---
+            # --- DYNAMIC BURN-IN SELECTION ---
             # ==========================================
-            # 1. Check if the sequence starts from a true physical resting state.
-            is_resting_start = torch.max(pressures[:, 0]).item() < 0.01
-            
-            # 2. Only allow Cold Starts if the robot is actually at rest.
-            if is_resting_start and random.random() < 0.50:
-                current_burn_in = 1
-            else:
+            # 30% of the time, we force a "Cold Start". The network gets NO 
+            # visual momentum history and must learn to break static inertia 
+            # and map pressure to movement from a dead stop.
+            if random.random() < 0.70:
                 current_burn_in = BURN_IN_LENGTH
+            else:
+                current_burn_in = 1
             
             # ==========================================
-            # --- PHASE 1: BURN-IN ---
+            # --- PHASE 1: THE BURN-IN ---
             # ==========================================
             for t in range(current_burn_in - 1):
                 action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
@@ -219,33 +215,24 @@ def main():
                 # Step the physics engine to build memory
                 _, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
                 
-                # Force the visual state to reality for the next step
+                # Force the visual state to reality (Teacher Forcing) for the next step
                 current_tri_planes = encoder(videos[:, t+1])
                 
             # ==========================================
-            # --- PHASE 2: AUTOREGRESSION (CURRICULUM) ---
+            # --- PHASE 2: AUTOREGRESSION ---
             # ==========================================
-            # Start with 2 predicted frames, add 2 more every 10 epochs, capped at the sequence length
-            max_allowed_steps = min(Time - current_burn_in, 2 + (epoch // 10) * 2)
-            
-            for t in range(current_burn_in - 1, current_burn_in - 1 + max_allowed_steps):
+            for t in range(current_burn_in - 1, Time - 1):
                 
-                # Apply the trajectory-level augmentation globally to the step
+                # Action jittering: Adds small random noise to the pressures to prevent overfitting to exact values 
+                # and encourage learning of smooth dynamics. 
                 base_action = pressures[:, t]
-                action_t = torch.clamp(base_action + sequence_action_noise, min=0.00001, max=1.0)
+                action_noise = (torch.rand_like(base_action) - 0.5) * 0.05
+                action_t = torch.clamp(base_action + action_noise, min=0.00001, max=1.0)
+                
                 frames_next_true = videos[:, t+1] 
                 
-                # Predict the next latent state
+                # Predict the next 3D state ENTIRELY BLIND
                 planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
-
-                # --- LATENT CONSISTENCY ---
-                # Encode the actual next frame to see where the dynamics "should" have landed
-                with torch.no_grad(): # we don't want to accidentally train the encoder to cheat
-                    planes_next_real = encoder(frames_next_true)
-
-                latent_loss = 0.0
-                for pk in ['xy', 'xz', 'yz']:
-                    latent_loss += l1_loss_fn(planes_next_pred[pk], planes_next_real[pk])
                 
                 # Render the current frame
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
@@ -255,7 +242,7 @@ def main():
                 # 1. Combined BCE and Dice Loss (Shape: [B])
                 raw_bce = bce_loss_fn(rgb_pred, target_rgb)
                 loss_bce = raw_bce.view(B, -1).mean(dim=1) 
-
+                
                 loss_dice = dice_loss_per_batch(rgb_pred, target_rgb)
                 
                 # 2. 3D Sparsity Loss (Shape: [B])
@@ -264,45 +251,28 @@ def main():
                 eps = 1e-6
                 entropy = -random_probs * torch.log(random_probs + eps) - (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
                 sparsity_loss = entropy.view(B, -1).mean(dim=1) # Average entropy per batch item
+                lambda_sparse = 0.005
                 
-                # ==========================================
-                # --- CALCULATE LOSS ---
-                # ==========================================
-                # Consistency Loss: Decays from 5.0 to 1.0 over 150 epochs
-                lambda_latent = max(1.0, 5.0 - (epoch / 150.0) * 4.0) 
-                
-                # Add warmup: Ramps up losses over time
-                warmup_ratio = min(1.0, epoch / 100.0) # Hits 1.0 at Epoch 100
-                lambda_sparsity = 0.05 + (0.10 * warmup_ratio) # Scales from 0.05 to 0.15
-                lambda_dice = 2.0 + (1.0 * warmup_ratio)       # Scales from 2.0 to 3.0
-                
-                step_loss = (loss_bce + (lambda_dice * loss_dice) + (lambda_sparsity * sparsity_loss) + (lambda_latent * latent_loss)).mean()
+                # Objective loss summation without artificial pressure multipliers
+                step_loss = (loss_bce + loss_dice + (lambda_sparse * sparsity_loss)).mean()
                 
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
                 # --- STRICT AUTOREGRESSION ---
                 # Feed our own prediction back into the network. 
-                # We rely entirely on Latent Consistency Loss to keep us grounded to reality.
                 current_tri_planes = {k: v for k, v in planes_next_pred.items()}
 
             # We only average the loss over the steps we actually predicted
-            if autoregressive_steps > 0:
-                batch_sequence_loss = batch_sequence_loss / autoregressive_steps
-                batch_sequence_loss.backward()
-                
-                # Gradient clipping prevents the network from blowing up during pure autoregression
-                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-                optimizer.step()
-                
-                epoch_loss += batch_sequence_loss.item()
-
-                # delete autoregressive variables only if they were created
-                del ray_origins, ray_dirs, target_rgb, rgb_pred, planes_next_pred, step_loss
+            batch_sequence_loss = batch_sequence_loss / autoregressive_steps
+            batch_sequence_loss.backward()
             
-            # --- MEMORY CLEANUP ---
-            # These variables are guaranteed to exist regardless of sequence length
-            del videos, pressures, current_tri_planes, batch_sequence_loss
+            # Gradient clipping prevents the network from blowing up during pure autoregression
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            optimizer.step()
+            
+            epoch_loss += batch_sequence_loss.item()
+            
             
         # Step the learning rate down appropriately per epoch
         scheduler.step()
@@ -315,7 +285,7 @@ def main():
             scheduler.base_lrs = [base_lr * 0.5 for base_lr in scheduler.base_lrs]
             print(f">>> LR Warm Restart: Peak decayed to {scheduler.base_lrs[0]:.6f}")
             
-        avg_loss = epoch_loss / max(1, len(dataloader)) 
+        avg_loss = epoch_loss / len(dataloader)
         
         # ==========================================
         # --- VALIDATION PHASE ---
@@ -364,7 +334,7 @@ def main():
                     val_step_loss = (loss_bce_val + loss_dice_val).mean()
                     val_loss += val_step_loss.item()
                     val_autoregressive_steps += 1
-                    
+
                     # ---------------------------------------------------------
                     # VALIDATION VISUALIZATION BLOCK
                     # ---------------------------------------------------------
@@ -390,28 +360,19 @@ def main():
                             writer.add_image(f'Validation_Autoregressive_{stage_name}/Side_{v+1}', comparison_grid, epoch + 1)
                     
                     curr_planes = pred_planes
-                
-                # Clean up Validation Memory too
-                del vids_val, press_val, curr_planes, h_val
-                    
-        # Protect against zero-division if validation sequences are too short
-        avg_val_loss = val_loss / max(1, val_autoregressive_steps)
+
+        avg_val_loss = val_loss / val_autoregressive_steps
         
-        # Print and Log metrics to TensorBoard
+        # Print and Log to TensorBoard
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
         writer.add_scalar('Training/Validation_Loss', avg_val_loss, epoch + 1)
-        
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
         # ==========================================
         # --- CHECKPOINT SAVING ---
         # ==========================================
-        is_best = avg_val_loss < best_val_loss
-        if is_best:
-            best_val_loss = avg_val_loss
-            
         checkpoint_dict = {
             'epoch': epoch + 1,
             'best_val_loss': best_val_loss,
@@ -422,10 +383,12 @@ def main():
             'decoder': decoder.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'scheduler_base_lrs': scheduler.base_lrs 
+            'scheduler_base_lrs': scheduler.base_lrs # Preserves LR decay
         }
         
-        if is_best:
+        # Save the best overall model
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
             torch.save(checkpoint_dict, os.path.join(log_dir, "best_model.pth"))
             print(f"*** New Best Model Saved (Val Loss: {best_val_loss:.6f}) ***")
 
@@ -433,7 +396,7 @@ def main():
         if (epoch + 1) % 50 == 0:
             torch.save(checkpoint_dict, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
             
-        # ALWAYS save the latest state
+        # ALWAYS save the latest state so progress is never lost during sudden stops
         torch.save(checkpoint_dict, os.path.join(log_dir, "last_checkpoint.pth"))
 
     writer.close()
