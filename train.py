@@ -48,7 +48,7 @@ def main():
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    log_dir = f"runs/revert_1_spatialAttention_pureAR_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/revert_3_onlyCurriculumLearning_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -169,6 +169,17 @@ def main():
     # Initialize with reduction='none' so it outputs per-pixel losses
     bce_loss_fn = nn.BCELoss(reduction='none') # Use BCE instead of L1 for sharper edges
 
+    # === Step-Wise Curriculum Scheduler ===
+    def get_curriculum_seq_len(current_epoch):
+        # We ensure the total sequence length is always greater than BURN_IN_LENGTH (5)
+        # so that Phase 2 (Autoregression) always has frames to predict.
+        if current_epoch < 30:
+            return BURN_IN_LENGTH + 4   # Crawl: Predict 4 steps into the future (Total 9)
+        elif current_epoch < 70:
+            return BURN_IN_LENGTH + 11  # Walk: Predict 11 steps into the future (Total 16)
+        else:
+            return SEQUENCE_LENGTH      # Run: Predict the full 24-frame sequence
+
     # 5. The Training Loop
     for epoch in range(start_epoch, NUM_EPOCHS):
         encoder.train()
@@ -221,15 +232,15 @@ def main():
             # ==========================================
             # --- PHASE 2: AUTOREGRESSION ---
             # ==========================================
-            for t in range(current_burn_in - 1, Time - 1):
+            current_max_seq = get_curriculum_seq_len(epoch)
+            time_limit = min(Time, current_max_seq)
+
+            for t in range(current_burn_in - 1, time_limit - 1):
                 
-                # Action jittering: Adds small random noise to the pressures to prevent overfitting to exact values 
-                # and encourage learning of smooth dynamics. 
-                base_action = pressures[:, t]
-                action_noise = (torch.rand_like(base_action) - 0.5) * 0.05
-                action_t = torch.clamp(base_action + action_noise, min=0.00001, max=1.0)
+                # NO JITTERING. Strictly use the true pressure.
+                action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
                 
-                frames_next_true = videos[:, t+1] 
+                frames_next_true = videos[:, t+1]
                 
                 # Predict the next 3D state ENTIRELY BLIND
                 planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
@@ -239,39 +250,38 @@ def main():
                     frames_next_true, num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                 rgb_pred = ray_marcher.render_rays(decoder, planes_next_pred, ray_origins, ray_dirs)
                 
-                # 1. Combined BCE and Dice Loss (Shape: [B])
+                # 1. Combined BCE and Dice Loss
                 raw_bce = bce_loss_fn(rgb_pred, target_rgb)
                 loss_bce = raw_bce.view(B, -1).mean(dim=1) 
-                
                 loss_dice = dice_loss_per_batch(rgb_pred, target_rgb)
                 
-                # 2. 3D Sparsity Loss (Shape: [B])
+                # 2. 3D Sparsity Loss
                 random_points_3d = (torch.rand(B, 1024, 3, device=device) * 2.0) - 1.0
                 random_probs, _ = decoder(planes_next_pred, random_points_3d)
                 eps = 1e-6
                 entropy = -random_probs * torch.log(random_probs + eps) - (1.0 - random_probs) * torch.log(1.0 - random_probs + eps)
-                sparsity_loss = entropy.view(B, -1).mean(dim=1) # Average entropy per batch item
+                sparsity_loss = entropy.view(B, -1).mean(dim=1) 
                 lambda_sparse = 0.005
                 
-                # Objective loss summation without artificial pressure multipliers
+                # Objective loss summation (NO LATENT CONSISTENCY)
                 step_loss = (loss_bce + loss_dice + (lambda_sparse * sparsity_loss)).mean()
                 
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
                 # --- STRICT AUTOREGRESSION ---
-                # Feed our own prediction back into the network. 
                 current_tri_planes = {k: v for k, v in planes_next_pred.items()}
 
-            # We only average the loss over the steps we actually predicted
-            batch_sequence_loss = batch_sequence_loss / autoregressive_steps
-            batch_sequence_loss.backward()
-            
-            # Gradient clipping prevents the network from blowing up during pure autoregression
-            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-            optimizer.step()
-            
-            epoch_loss += batch_sequence_loss.item()
+            # We only average the loss and backpropagate if we actually predicted steps
+            if autoregressive_steps > 0:
+                batch_sequence_loss = batch_sequence_loss / autoregressive_steps
+                batch_sequence_loss.backward()
+                
+                # Gradient clipping prevents the network from blowing up during pure autoregression
+                torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+                optimizer.step()
+                
+                epoch_loss += batch_sequence_loss.item()
             
             
         # Step the learning rate down appropriately per epoch
