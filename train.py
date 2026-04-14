@@ -48,7 +48,7 @@ def main():
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    log_dir = f"runs/revert_3_onlyCurriculumLearning_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/revert_5_spatialDropout_narrowMemory_CurriculumLearning_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -237,25 +237,23 @@ def main():
 
             for t in range(current_burn_in - 1, time_limit - 1):
                 
-                # NO JITTERING. Strictly use the true pressure.
                 action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
-                
                 frames_next_true = videos[:, t+1]
                 
                 # Predict the next 3D state ENTIRELY BLIND
                 planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
-                
-                # Render the current frame
+
+                # Render the current frame using the planes
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
                     frames_next_true, num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                 rgb_pred = ray_marcher.render_rays(decoder, planes_next_pred, ray_origins, ray_dirs)
                 
-                # 1. Combined BCE and Dice Loss
+                # Combined BCE and Dice Loss
                 raw_bce = bce_loss_fn(rgb_pred, target_rgb)
                 loss_bce = raw_bce.view(B, -1).mean(dim=1) 
                 loss_dice = dice_loss_per_batch(rgb_pred, target_rgb)
                 
-                # 2. 3D Sparsity Loss
+                # 3D Sparsity Loss
                 random_points_3d = (torch.rand(B, 1024, 3, device=device) * 2.0) - 1.0
                 random_probs, _ = decoder(planes_next_pred, random_points_3d)
                 eps = 1e-6
@@ -263,13 +261,13 @@ def main():
                 sparsity_loss = entropy.view(B, -1).mean(dim=1) 
                 lambda_sparse = 0.005
                 
-                # Objective loss summation (NO LATENT CONSISTENCY)
+                # Final summation
                 step_loss = (loss_bce + loss_dice + (lambda_sparse * sparsity_loss)).mean()
                 
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
-                # --- STRICT AUTOREGRESSION ---
+                # STRICT AUTOREGRESSION: Feed the predicted planes back in for the next step
                 current_tri_planes = {k: v for k, v in planes_next_pred.items()}
 
             # We only average the loss and backpropagate if we actually predicted steps
@@ -305,6 +303,8 @@ def main():
         decoder.eval()
         val_loss = 0.0
         val_autoregressive_steps = 0
+        val_latent_velocity = 0.0
+        val_sharpness = 0.0
         
         with torch.no_grad():
             for val_batch_idx, batch in enumerate(val_loader):
@@ -342,6 +342,17 @@ def main():
                     loss_dice_val = dice_loss_per_batch(rgb_p, target)
                     
                     val_step_loss = (loss_bce_val + loss_dice_val).mean()
+
+                    # 1. Latent Velocity: Is the engine moving, or is it frozen?
+                    # Measure absolute L1 change in TriPlanes from step t to t+1
+                    step_velocity = torch.mean(torch.abs(pred_planes['xy'] - curr_planes['xy']))
+                    val_latent_velocity += step_velocity.item()
+                    
+                    # 2. Visual Sharpness: Is the Decoder outputting cloudy safe-guesses?
+                    # Blurry grey clouds have low variance.
+                    step_sharpness = torch.var(rgb_p)
+                    val_sharpness += step_sharpness.item()
+
                     val_loss += val_step_loss.item()
                     val_autoregressive_steps += 1
 
@@ -368,11 +379,20 @@ def main():
                             
                             comparison_grid = torch.cat((real_frame, pred_frame), dim=2)
                             writer.add_image(f'Validation_Autoregressive_{stage_name}/Side_{v+1}', comparison_grid, epoch + 1)
-                    
+                        
+
                     curr_planes = pred_planes
 
-        avg_val_loss = val_loss / val_autoregressive_steps
-        
+        # Safely average the validation metrics
+        safe_val_steps = max(1, val_autoregressive_steps)
+        avg_val_loss = val_loss / safe_val_steps
+        avg_val_velocity = val_latent_velocity / safe_val_steps
+        avg_val_sharpness = val_sharpness / safe_val_steps
+
+        # --- NEW DIAGNOSTIC METRICS ---
+        writer.add_scalar('Diagnostics/Latent_Velocity', avg_val_velocity, epoch + 1)
+        writer.add_scalar('Diagnostics/Visual_Sharpness', avg_val_sharpness, epoch + 1)
+
         # Print and Log to TensorBoard
         print(f"Epoch [{epoch+1}/{NUM_EPOCHS}] | Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
         writer.add_scalar('Training/Sequence_Loss', avg_loss, epoch + 1)
