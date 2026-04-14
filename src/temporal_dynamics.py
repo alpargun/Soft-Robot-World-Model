@@ -55,13 +55,17 @@ class TriPlaneDynamics(nn.Module):
         # 2. Shared Physics Engine
         self.dynamics_rnn = ConvGRUCell(
             input_dim=feature_dim + action_embed_dim, 
-            hidden_dim=feature_dim
+            hidden_dim=action_embed_dim
         )
 
-        self.h0_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        # Projects 64-dim visual planes down to 32-dim memory for initialization
+        self.h0_proj = nn.Conv2d(feature_dim, action_embed_dim, kernel_size=1)
         
-        # Separates the clamped hidden state memory from the unbounded visual features
-        self.plane_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        # Projects 32-dim memory up to 64-dim visual planes for the decoder
+        self.plane_proj = nn.Conv2d(action_embed_dim, feature_dim, kernel_size=1)
+
+        # Add visual dropout to encourage the model to use the hidden state for memory, not just the visual features
+        self.memory_dropout = nn.Dropout2d(p=0.20)
 
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
         B, C, H, W = tri_planes_t['xy'].shape
@@ -90,7 +94,11 @@ class TriPlaneDynamics(nn.Module):
         
         for plane_key in ['xy', 'xz', 'yz']:
             coupled_input = torch.cat([tri_planes_t[plane_key], plane_actions[plane_key]], dim=1)
-            h_new = self.dynamics_rnn(coupled_input, hidden_states_prev[plane_key])
+            
+            # Degrade the memory to force reliance on the action tensor
+            h_prev_dropped = self.memory_dropout(hidden_states_prev[plane_key])
+            
+            h_new = self.dynamics_rnn(coupled_input, h_prev_dropped)
             
             # Decouple the visual plane from the bounded hidden state
             tri_planes_next[plane_key] = self.plane_proj(h_new)
