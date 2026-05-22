@@ -6,6 +6,7 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
@@ -48,7 +49,7 @@ def main():
     # Initialize TensorBoard Writer and Log Directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    log_dir = f"runs/revert_5_spatialDropout_narrowMemory_CurriculumLearning_{IMAGE_MODE.upper()}_{timestamp}"
+    log_dir = f"runs/revert_7_inverseDynamics_{IMAGE_MODE.upper()}_{timestamp}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard is active. Run 'tensorboard --logdir=runs' to view.")
     print(f"Checkpoints will be saved to: {log_dir}")
@@ -243,6 +244,26 @@ def main():
                 # Predict the next 3D state ENTIRELY BLIND
                 planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
 
+                # ==========================================
+                # --- SEQUENCE INVERSE AUXILIARY LOSS ---
+                # ==========================================
+                loss_inverse = 0.0
+                history_len = dynamics.history_len
+                
+                # Only calculate inverse loss if we have enough historical frames to compare against
+                if t >= history_len - 1:
+                    # Slice the last 'n' ground truth actions
+                    target_action_seq = pressures[:, t - history_len + 1 : t + 1]
+                    
+                    # Predict the sequence of actions that caused this hysteresis state
+                    pred_action_seq = dynamics.predict_inverse_action_sequence(current_tri_planes, planes_next_pred)
+                    
+                    # Apply heavy MSE penalty
+                    loss_inverse = F.mse_loss(pred_action_seq, target_action_seq)
+                
+                lambda_inverse = 2.0 # Strong weight to forcefully bind actions to physics
+                # ==========================================
+
                 # Render the current frame using the planes
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
                     frames_next_true, num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
@@ -262,7 +283,7 @@ def main():
                 lambda_sparse = 0.005
                 
                 # Final summation
-                step_loss = (loss_bce + loss_dice + (lambda_sparse * sparsity_loss)).mean()
+                step_loss = (loss_bce + loss_dice + (lambda_sparse * sparsity_loss) + (lambda_inverse * loss_inverse)).mean()
                 
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
@@ -280,6 +301,9 @@ def main():
                 optimizer.step()
                 
                 epoch_loss += batch_sequence_loss.item()
+                
+        # Log the inverse loss to tensorboard at the end of the epoch
+        writer.add_scalar('Training/Inverse_Action_Loss', loss_inverse.item() if isinstance(loss_inverse, torch.Tensor) else 0.0, epoch + 1)
             
             
         # Step the learning rate down appropriately per epoch

@@ -67,6 +67,23 @@ class TriPlaneDynamics(nn.Module):
         # Add visual dropout to encourage the model to use the hidden state for memory, not just the visual features
         self.memory_dropout = nn.Dropout2d(p=0.20)
 
+        # SEQUENCE INVERSE DYNAMICS HEAD
+        self.history_len = 5 # Number of past actions to predict to account for hysteresis
+        
+        self.inverse_head = nn.Sequential(
+            nn.Conv2d(self.feature_dim * 2, 32, kernel_size=3, padding=1, stride=2),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, stride=2),
+            nn.LeakyReLU(0.2),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(64, 32),
+            nn.LeakyReLU(0.2),
+            # Output dimension is now (3 pressures * 5 frames) = 15
+            nn.Linear(32, action_dim * self.history_len), 
+            nn.Sigmoid() 
+        )
+
     def forward(self, tri_planes_t, action_t, hidden_states_prev=None):
         B, C, H, W = tri_planes_t['xy'].shape
         
@@ -100,8 +117,28 @@ class TriPlaneDynamics(nn.Module):
             
             h_new = self.dynamics_rnn(coupled_input, h_prev_dropped)
             
-            # Decouple the visual plane from the bounded hidden state
-            tri_planes_next[plane_key] = self.plane_proj(h_new)
+            # Predict the DELTA (change), and add it to the current state.
+            delta_plane = self.plane_proj(h_new)
+            tri_planes_next[plane_key] = tri_planes_t[plane_key] + delta_plane
+            
             hidden_states_new[plane_key] = h_new
             
         return tri_planes_next, hidden_states_new
+    
+    def predict_inverse_action_sequence(self, planes_t, planes_next):
+        """Forces the network to deduce the action history from the physical change."""
+        B = planes_t['xy'].shape[0]
+        inverse_features = []
+        for plane_key in ['xy', 'xz', 'yz']:
+            coupled_state = torch.cat([planes_t[plane_key], planes_next[plane_key]], dim=1)
+            inverse_features.append(coupled_state)
+            
+        pred_seq_xy = self.inverse_head(inverse_features[0])
+        pred_seq_xz = self.inverse_head(inverse_features[1])
+        pred_seq_yz = self.inverse_head(inverse_features[2])
+        
+        # Consensus of the 3 planes
+        combined_pred = (pred_seq_xy + pred_seq_xz + pred_seq_yz) / 3.0
+        
+        # Reshape to [Batch, History_Len, Action_Dim]
+        return combined_pred.view(B, self.history_len, -1)
