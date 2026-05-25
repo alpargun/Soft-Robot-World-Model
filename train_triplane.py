@@ -19,20 +19,7 @@ from src.encoder import TriPlaneEncoder
 from src.temporal_dynamics import TriPlaneDynamics
 from src.decoder import TriPlaneDecoder
 from src.renderer import VolumetricRayMarcher, sample_orthographic_rays, get_full_image_rays, render_rays_chunked
-
-def dice_loss_per_batch(pred, target, smooth=1e-5):
-    # Preserve the batch dimension [B], flatten the spatial/channel dimensions [-1]
-    B = pred.shape[0]
-    pred_flat = pred.contiguous().view(B, -1)
-    target_flat = target.contiguous().view(B, -1)
-    
-    # Sum across the spatial dimensions (dim=1), maintaining shape [B]
-    intersection = (pred_flat * target_flat).sum(dim=1)
-    
-    # Dice formula calculates a distinct coefficient for each item in the batch
-    dice_coeff = (2.0 * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
-    
-    return 1.0 - dice_coeff # Returns a tensor of shape [B]
+from src.utils.losses import dice_loss_per_batch
 
 def main():
     
@@ -93,10 +80,7 @@ def main():
         seq_len=None, frame_stride=FRAME_STRIDE
     )
 
-    # ==========================================
-    # --- Validation Split ---
-    # ==========================================
-    # Randomly select 15% of the pure bending cases for validation
+    # Validation Split
     all_bending_indices = []
     special_indices = []
     
@@ -129,7 +113,7 @@ def main():
 
     # 3. Initialize Model Components
     encoder = TriPlaneEncoder(feature_dim=FEATURE_DIM).to(device)
-    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=32).to(device)
+    dynamics = TriPlaneDynamics(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=64).to(device)
     decoder = TriPlaneDecoder(feature_dim=FEATURE_DIM, image_mode=IMAGE_MODE).to(device)
     ray_marcher = VolumetricRayMarcher(num_samples=64).to(device)
 
@@ -167,7 +151,7 @@ def main():
         best_val_loss = checkpoint['best_val_loss']
 
     # Define Loss Functions
-    # Initialize with reduction='none' so it outputs per-pixel losses
+    # reduction='none' so it outputs per-pixel losses
     bce_loss_fn = nn.BCELoss(reduction='none') # Use BCE instead of L1 for sharper edges
 
     # === Step-Wise Curriculum Scheduler ===
@@ -207,20 +191,15 @@ def main():
             batch_sequence_loss = 0.0
             autoregressive_steps = 0
             
-            # ==========================================
-            # --- DYNAMIC BURN-IN SELECTION ---
-            # ==========================================
-            # 30% of the time, we force a "Cold Start". The network gets NO 
-            # visual momentum history and must learn to break static inertia 
-            # and map pressure to movement from a dead stop.
+            # BURN-IN
+            # 30% of the time, we force a "Cold Start". The network gets NO visual momentum history and must learn 
+            # to break static inertia and map pressure to movement from a dead stop.
             if random.random() < 0.70:
                 current_burn_in = BURN_IN_LENGTH
             else:
                 current_burn_in = 1
             
-            # ==========================================
-            # --- PHASE 1: THE BURN-IN ---
-            # ==========================================
+            # PHASE 1: BURN-IN
             for t in range(current_burn_in - 1):
                 action_t = torch.clamp(pressures[:, t], min=0.00001, max=1.0)
                 
@@ -230,9 +209,7 @@ def main():
                 # Force the visual state to reality (Teacher Forcing) for the next step
                 current_tri_planes = encoder(videos[:, t+1])
                 
-            # ==========================================
-            # --- PHASE 2: AUTOREGRESSION ---
-            # ==========================================
+            # PHASE 2: AUTOREGRESSION
             current_max_seq = get_curriculum_seq_len(epoch)
             time_limit = min(Time, current_max_seq)
 
@@ -244,9 +221,7 @@ def main():
                 # Predict the next 3D state ENTIRELY BLIND
                 planes_next_pred, hidden_state = dynamics(current_tri_planes, action_t, hidden_state)
 
-                # ==========================================
-                # --- SEQUENCE INVERSE AUXILIARY LOSS ---
-                # ==========================================
+                # SEQUENCE INVERSE AUXILIARY LOSS
                 loss_inverse = 0.0
                 history_len = dynamics.history_len
                 
@@ -262,7 +237,6 @@ def main():
                     loss_inverse = F.mse_loss(pred_action_seq, target_action_seq)
                 
                 lambda_inverse = 2.0 # Strong weight to forcefully bind actions to physics
-                # ==========================================
 
                 # Render the current frame using the planes
                 ray_origins, ray_dirs, target_rgb = sample_orthographic_rays(
@@ -305,11 +279,10 @@ def main():
         # Log the inverse loss to tensorboard at the end of the epoch
         writer.add_scalar('Training/Inverse_Action_Loss', loss_inverse.item() if isinstance(loss_inverse, torch.Tensor) else 0.0, epoch + 1)
             
-            
         # Step the learning rate down appropriately per epoch
         scheduler.step()
 
-        # --- DECAYING PEAK LR LOGIC ---
+        # DECAYING PEAK LR LOGIC
         if (epoch + 1) % 150 == 0: # Every 150 epochs, apply a warm restart with a decayed peak learning rate
             for param_group in optimizer.param_groups:
                 if 'initial_lr' in param_group:
@@ -319,9 +292,7 @@ def main():
             
         avg_loss = epoch_loss / len(dataloader)
         
-        # ==========================================
-        # --- VALIDATION PHASE ---
-        # ==========================================
+        # VALIDATION
         encoder.eval()
         dynamics.eval()
         decoder.eval()
@@ -339,15 +310,13 @@ def main():
                 curr_planes = encoder(vids_val[:, 0])
                 h_val = None
 
-                # --- VAL PHASE 1: BURN-IN ---
-                # Kept strictly at BURN_IN_LENGTH so validation metrics remain 
-                # completely stable and comparable epoch-to-epoch.
+                # VAL PHASE 1: BURN-IN
                 for t in range(BURN_IN_LENGTH - 1):
                     action_val = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
                     _, h_val = dynamics(curr_planes, action_val, h_val)
                     curr_planes = encoder(vids_val[:, t+1])
                 
-                # --- VAL PHASE 2: AUTOREGRESSION ---
+                # VAL PHASE 2: AUTOREGRESSION
                 for t in range(BURN_IN_LENGTH - 1, V_Time - 1):
                     # Apply the same clamping to validation pressures
                     action_val_clamped = torch.clamp(press_val[:, t], min=0.00001, max=1.0)
@@ -360,7 +329,7 @@ def main():
                         vids_val[:, t+1], num_samples=RAYS_PER_STEP, image_mode=IMAGE_MODE)
                     rgb_p = ray_marcher.render_rays(decoder, pred_planes, ray_o, ray_d)
                     
-                    # === Hybrid BCE+Dice Loss for Validation ===
+                    # Hybrid BCE+Dice Loss for Validation
                     raw_bce_val = bce_loss_fn(rgb_p, target)
                     loss_bce_val = raw_bce_val.view(B_val, -1).mean(dim=1)
                     loss_dice_val = dice_loss_per_batch(rgb_p, target)
@@ -380,14 +349,12 @@ def main():
                     val_loss += val_step_loss.item()
                     val_autoregressive_steps += 1
 
-                    # ---------------------------------------------------------
-                    # VALIDATION VISUALIZATION BLOCK
-                    # ---------------------------------------------------------
+                    # VALIDATION VISUALIZATION
                     # Log every 10 epochs, ONLY on the first validation batch
                     if (epoch + 1) % 10 == 0 and val_batch_idx == 0 and (t == (V_Time // 2) or t == (V_Time - 2)):
-                        
+
                         stage_name = "Val_Middle" if t == (V_Time // 2) else "Val_Last"
-                        
+
                         for v in range(Views):
                             real_frame = vids_val[0, t+1, v].detach().cpu()
                             full_ray_origins, full_ray_dirs = get_full_image_rays(H, W, view_idx=v, device=device)
@@ -413,7 +380,7 @@ def main():
         avg_val_velocity = val_latent_velocity / safe_val_steps
         avg_val_sharpness = val_sharpness / safe_val_steps
 
-        # --- NEW DIAGNOSTIC METRICS ---
+        # DIAGNOSTIC METRICS
         writer.add_scalar('Diagnostics/Latent_Velocity', avg_val_velocity, epoch + 1)
         writer.add_scalar('Diagnostics/Visual_Sharpness', avg_val_sharpness, epoch + 1)
 
@@ -424,9 +391,7 @@ def main():
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
-        # ==========================================
-        # --- CHECKPOINT SAVING ---
-        # ==========================================
+        # SAVE CHECKPOINT
         checkpoint_dict = {
             'epoch': epoch + 1,
             'best_val_loss': best_val_loss,
@@ -446,11 +411,11 @@ def main():
             torch.save(checkpoint_dict, os.path.join(log_dir, "best_model.pth"))
             print(f"*** New Best Model Saved (Val Loss: {best_val_loss:.6f}) ***")
 
-        # Save milestone checkpoints every 50 epochs
+        # Save checkpoints every 50 epochs
         if (epoch + 1) % 50 == 0:
             torch.save(checkpoint_dict, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
             
-        # ALWAYS save the latest state so progress is never lost during sudden stops
+        # always save the latest state so progress is never lost during sudden stops
         torch.save(checkpoint_dict, os.path.join(log_dir, "last_checkpoint.pth"))
 
     writer.close()
