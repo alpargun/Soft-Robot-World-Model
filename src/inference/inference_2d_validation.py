@@ -68,7 +68,7 @@ def render_side_by_side_video(frames_gt, frames_pred, pressures, burn_in_len, ou
 def main():
     CHECKPOINT_PATH = "runs/singleView12_MASK_2026-05-24_13-30-07/best_model.pth" 
     MASTER_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis"
-    OUTPUT_DIR = "validation_videos_annotated"
+    OUTPUT_DIR = "validation_videos"
     
     FEATURE_DIM = 64
     BURN_IN_LENGTH = 5
@@ -149,7 +149,7 @@ def main():
         return gt_frames, pred_frames, used_pressures
 
     # Process validation cases
-    num_cases_to_render = min(5, len(val_dataset)) 
+    num_cases_to_render = len(val_dataset)
     
     for i in range(num_cases_to_render):
         sample = val_dataset[i]
