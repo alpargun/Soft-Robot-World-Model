@@ -3,10 +3,9 @@ import random
 import torch
 import numpy as np
 import cv2
-from tqdm import tqdm
 from torch.utils.data import Subset
 
-# Import your baseline modules
+# Import custom modules
 from src.encoder_2d import Encoder2D
 from src.decoder_2d import Decoder2D
 from src.temporal_dynamics_2d import Dynamics2D
@@ -19,8 +18,7 @@ def render_side_by_side_video(frames_gt, frames_pred, pressures, burn_in_len, ou
     """
     base_height, base_width = frames_gt[0].shape[-2:]
     
-    # UPSCALE FACTOR: Multiply resolution by 3 so text has room to breathe
-    SCALE = 3 
+    SCALE = 3 # Multiply resolution by 3 so text can fit
     height = base_height * SCALE
     width = base_width * SCALE
     
@@ -37,24 +35,23 @@ def render_side_by_side_video(frames_gt, frames_pred, pressures, burn_in_len, ou
         gt_bgr = cv2.cvtColor(gt_img, cv2.COLOR_GRAY2BGR)
         pred_bgr = cv2.cvtColor(pred_img, cv2.COLOR_GRAY2BGR)
         
-        # --- UPSCALE ---
-        # INTER_NEAREST preserves the sharp model pixels without faking HD blur
+        # UPSCALE: INTER_NEAREST preserves the sharp model pixels without faking HD blur
         gt_bgr = cv2.resize(gt_bgr, (width, height), interpolation=cv2.INTER_NEAREST)
         pred_bgr = cv2.resize(pred_bgr, (width, height), interpolation=cv2.INTER_NEAREST)
         
         # Concatenate horizontally
         combined_frame = np.concatenate((gt_bgr, pred_bgr), axis=1)
         
-        # --- TELEMETRY OVERLAY ---
-        # 1. Column Labels
+        # Write text over the video
+        # Column Labels
         cv2.putText(combined_frame, "Ground Truth", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.putText(combined_frame, "Prediction", (width + 15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # 2. Pressure Vectors (Bottom Center of the Pred frame)
+        # Pressure Vectors (Bottom Center of the Pred frame)
         p_text = f"P: [{p[0]:.2f}, {p[1]:.2f}, {p[2]:.2f}]"
         cv2.putText(combined_frame, p_text, (width + 15, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
-        # 3. Network State Tracker
+        # Burn-in vs Autoregressive State (Top Center of the Pred frame)
         if idx < burn_in_len - 1:
             state_text = "STATE: BURN-IN"
             color = (0, 165, 255) # Orange
@@ -69,8 +66,6 @@ def render_side_by_side_video(frames_gt, frames_pred, pressures, burn_in_len, ou
     out_video.release()
 
 def main():
-    # --- CONFIGURATION ---
-    # IMPORTANT: Update this to your singleView12 checkpoint folder name
     CHECKPOINT_PATH = "runs/singleView12_MASK_2026-05-24_13-30-07/best_model.pth" 
     MASTER_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis"
     OUTPUT_DIR = "validation_videos_annotated"
@@ -84,7 +79,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Running Annotated Validation Inference on: {device}")
 
-    # 1. Re-create the EXACT Validation Dataset
+    # Reconstruct the Validation Dataset
     DATA_DIRS = [os.path.join(MASTER_DIR, d) for d in os.listdir(MASTER_DIR) if os.path.isdir(os.path.join(MASTER_DIR, d)) and d != "old"]
     val_base = SoftRobotDataset(run_folders=DATA_DIRS, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=None, frame_stride=FRAME_STRIDE)
 
@@ -100,12 +95,12 @@ def main():
     
     print(f"Loaded {len(val_dataset)} Validation Sequences.")
 
-    # 2. Initialize Baseline Architecture (singleView12)
+    # Initialize Baseline Architecture
     encoder = Encoder2D(feature_dim=FEATURE_DIM).to(device)
     dynamics = Dynamics2D(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=64).to(device)
     decoder = Decoder2D(feature_dim=FEATURE_DIM).to(device)
 
-    # 3. Load Weights
+    # Load Weights
     checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
     encoder.load_state_dict(checkpoint['encoder'])
     dynamics.load_state_dict(checkpoint['dynamics'])
@@ -115,7 +110,7 @@ def main():
     dynamics.eval()
     decoder.eval()
 
-    # 4. Rollout Engine
+    # Rollout Engine
     def autoregressive_rollout(video_seq, pressure_seq, start_t, max_steps):
         end_t = min(start_t + max_steps, video_seq.shape[0])
         if end_t - start_t <= BURN_IN_LENGTH:
@@ -153,7 +148,7 @@ def main():
                 
         return gt_frames, pred_frames, used_pressures
 
-    # 5. Process validation cases
+    # Process validation cases
     num_cases_to_render = min(5, len(val_dataset)) 
     
     for i in range(num_cases_to_render):

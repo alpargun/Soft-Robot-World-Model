@@ -20,8 +20,6 @@ class ConvGRUCell(nn.Module):
         return h_new
 
 class Dynamics2D(nn.Module):
-    # THE FIX: Increased action_embed_dim to 64. 
-    # This doubles the ConvGRU hidden state capacity, preventing the fading memory leak.
     def __init__(self, feature_dim=64, action_dim=3, action_embed_dim=64):
         super().__init__()
         self.feature_dim = feature_dim
@@ -70,7 +68,6 @@ class Dynamics2D(nn.Module):
         
         h_new = self.dynamics_rnn(coupled_input, h_prev_dropped)
         
-        # PURE SINGLEVIEW5 LOGIC: Direct decoding from the newly expanded GRU memory.
         features_next = self.feature_proj(h_new)
         
         return features_next, h_new

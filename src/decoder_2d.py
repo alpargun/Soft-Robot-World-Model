@@ -4,13 +4,11 @@ import torch.nn as nn
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        # Standard convolutions, no normalization
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode='replicate')
         self.act = nn.LeakyReLU(0.2)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, padding_mode='replicate')
 
     def forward(self, x):
-        # The "Express Lane": Adds the original input to the output to prevent gradient death
         return x + self.conv2(self.act(self.conv1(x)))
 
 class Decoder2D(nn.Module):

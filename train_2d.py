@@ -69,15 +69,13 @@ def main():
         seq_len=SEQUENCE_LENGTH, frame_stride=FRAME_STRIDE
     )
     
-    # Validation Base: seq_len=None. Returns the full original sequences
+    # Validation Base: seq_len=None returns the full original sequences
     val_base = SoftRobotDataset(
         run_folders=DATA_DIRS, img_size=(128, 128), crop_size=600, image_mode=IMAGE_MODE, 
         seq_len=None, frame_stride=FRAME_STRIDE
     )
 
-    # ==========================================
-    # --- Validation Split ---
-    # ==========================================
+    # Validation Split
     all_bending_indices = []
     special_indices = []
     
@@ -108,17 +106,17 @@ def main():
     dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
 
-    # 3. Initialize 2D Model Components
+    # Initialize 2D Model Components
     encoder = Encoder2D(feature_dim=FEATURE_DIM).to(device)
     dynamics = Dynamics2D(feature_dim=FEATURE_DIM, action_dim=3, action_embed_dim=64).to(device)
     decoder = Decoder2D(feature_dim=FEATURE_DIM).to(device)
 
-    # 4. Optimizer Setup
+    # Optimizer Setup
     all_params = list(encoder.parameters()) + list(dynamics.parameters()) + list(decoder.parameters())
     optimizer = optim.AdamW(all_params, lr=LEARNING_RATE, weight_decay=1e-6) # AdamW decouples weight decay from grad update
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
     
-    # --- RESUME CHECKPOINT ---
+    # RESUME CHECKPOINT
     best_val_loss = float('inf')
     start_epoch = 0
     if os.path.exists(RESUME_CHECKPOINT_PATH):
@@ -147,9 +145,9 @@ def main():
     # Initialize with reduction='none' so it outputs per-pixel losses
     bce_loss_fn = nn.BCELoss(reduction='none') # Use BCE instead of L1 for sharper edges
 
-    # === Step-Wise Curriculum Scheduler ===
+    # Step-Wise Curriculum Scheduler
     def get_curriculum_seq_len(current_epoch):
-        # We ensure the total sequence length is always greater than BURN_IN_LENGTH (5)
+        # Ensure the total sequence length is always greater than BURN_IN_LENGTH (5)
         # so that Phase 2 (Autoregression) always has frames to predict.
         if current_epoch < 30:
             return BURN_IN_LENGTH + 4   # Crawl: Predict 4 steps into the future (Total 9)
@@ -308,7 +306,7 @@ def main():
                     val_loss += (loss_bce_val + loss_dice_val).mean().item()
                     val_autoregressive_steps += 1
 
-                    # VALIDATION VISUALIZATION BLOCK
+                    # VALIDATION VISUALIZATION
                     # Log every 10 epochs, ONLY on the first validation batch
                     if (epoch + 1) % 10 == 0 and val_batch_idx == 0 and (t == (V_Time // 2) or t == (V_Time - 2)):
                         
@@ -331,9 +329,7 @@ def main():
         # Track LR visually
         writer.add_scalar('Training/Learning_Rate', scheduler.get_last_lr()[0], epoch + 1)
 
-        # ==========================================
-        # --- CHECKPOINT SAVING ---
-        # ==========================================
+        # SAVE CHECKPOINT SAVING
         checkpoint_dict = {
             'epoch': epoch + 1,
             'best_val_loss': best_val_loss,
@@ -353,11 +349,11 @@ def main():
             torch.save(checkpoint_dict, os.path.join(log_dir, "best_model.pth"))
             print(f"*** New Best Model Saved (Val Loss: {best_val_loss:.6f}) ***")
 
-        # Save milestone checkpoints every 50 epochs
+        # Save checkpoints every 50 epochs
         if (epoch + 1) % 50 == 0:
             torch.save(checkpoint_dict, os.path.join(log_dir, f"world_model_checkpoint_epoch_{epoch+1}.pth"))
             
-        # ALWAYS save the latest state so progress is never lost during sudden stops
+        # Always save the latest state so progress is never lost during sudden stops
         torch.save(checkpoint_dict, os.path.join(log_dir, "last_checkpoint.pth"))
 
     writer.close()
