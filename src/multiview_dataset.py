@@ -138,14 +138,15 @@ class SoftRobotDataset(Dataset):
 
                     # Instead of merging 3 channels, just add the channel dimension to the 2D array
                     mask_1c = np.expand_dims(mask_resized, axis=2) 
-                    frame_tensor = mask_1c.astype(np.float32) / 255.0
+                    frame_tensor = mask_1c
                     
                     # Channel-first format: [C, H, W] -> Now explicitly [1, 128, 128]
                     frame_tensor = np.transpose(frame_tensor, (2, 0, 1))
                     frames.append(frame_tensor)
                     
                 cap.release()
-                video_tensor = torch.tensor(np.array(frames)) # [Time, 1, 128, 128]
+                # Cast to torch.uint8 to save disk space and speed up loading (convert to float later during training)
+                video_tensor = torch.tensor(np.array(frames), dtype=torch.uint8) # [Time, 1, 128, 128]
                 all_views_frames.append(video_tensor)
                 
                 # Save the frame count for this specific view
@@ -159,10 +160,9 @@ class SoftRobotDataset(Dataset):
             videos = torch.stack(all_views_frames, dim=1) # [Time, Views, C, H, W]
             
             # 3. ALIGN TIME & STRICT NORMALIZATION
-            # Ensure CSV is long enough to match the videos (If not, we will trim the videos to match the CSV length)
             final_len = min(min_frames, pressures_kpa.shape[0])
             videos = videos[:final_len]
-            aligned_pressures = pressures_kpa[-final_len:]
+            aligned_pressures = pressures_kpa[:final_len] # Slicing from the start
             
             # Convert kPa to Pa to accurately map the physical values
             aligned_pressures_pa = aligned_pressures * 1000.0
@@ -183,6 +183,9 @@ class SoftRobotDataset(Dataset):
         # ==========================================
         videos = result["video"]          # Shape: [Time, Views, C, H, W]
         pressures = result["pressures"]   # Shape: [Time, 3]
+
+        # Convert the uint8 mask to float32 and normalize it right as it leaves the cache
+        videos = videos.float() / 255.0
         
         # 1. Apply the Temporal Stride
         # Skips redundant frames to force the network to learn translation, not memorization.
