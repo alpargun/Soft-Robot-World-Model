@@ -1,7 +1,5 @@
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 class VolumetricRayMarcher(nn.Module):
     def __init__(self, num_samples=64):
@@ -22,31 +20,32 @@ class VolumetricRayMarcher(nn.Module):
         B, num_rays, _ = ray_origins.shape
         device = ray_origins.device
         
-        # 1. Generate sample points along the ray (from 'near' to 'far')
+        # Generate sample points along the ray (from 'near' to 'far')
         t_vals = torch.linspace(near, far, self.num_samples, device=device)
         t_vals = t_vals.expand(B, num_rays, self.num_samples)
         
-        # Add a tiny bit of random noise during training to prevent aliasing (stratified sampling)
+        # Add small random noise during training to prevent aliasing (stratified sampling)
         if self.training:
             noise = (torch.rand_like(t_vals) - 0.5) * ((far - near) / self.num_samples)
             t_vals = t_vals + noise
 
-        # 2. Calculate the exact 3D coordinates for every point on every ray
+        # Calculate the exact 3D coordinates for every point on every ray
         points_3d = ray_origins.unsqueeze(2) + ray_directions.unsqueeze(2) * t_vals.unsqueeze(3)
         points_flat = points_3d.reshape(B, num_rays * self.num_samples, 3)
         
-        # 3. Query the Decoder
+        # Pass through the Decoder
         rgb_flat, density_flat = decoder(tri_planes, points_flat)
-        
-        # DYNAMIC CHANNEL RESHAPING
+
         out_channels = rgb_flat.shape[-1] 
-        
         rgb = rgb_flat.reshape(B, num_rays, self.num_samples, out_channels)
         density = density_flat.reshape(B, num_rays, self.num_samples)
         
         # 4. Volumetric Compositing
         deltas = t_vals[:, :, 1:] - t_vals[:, :, :-1]
-        last_delta = torch.full((B, num_rays, 1), 1e10, device=device)
+
+        step_size = (far - near) / self.num_samples
+        last_delta = torch.full((B, num_rays, 1), step_size, device=device)
+        
         deltas = torch.cat([deltas, last_delta], dim=2)
         
         # Alpha: How opaque is this specific segment?
@@ -65,10 +64,10 @@ class VolumetricRayMarcher(nn.Module):
     
 
 # Orthographic ray generator
-def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask"):
+def sample_orthographic_rays(target_frames, num_samples=1024):
     """
     Maps 2D pixel coordinates to 3D continuous ray origins and directions.
-    Strictly uses 50% Foreground / 50% Background sampling.
+    Uses 50% Foreground / 50% Background sampling.
     """
     B, Views, C, H, W = target_frames.shape
     device = target_frames.device
@@ -84,8 +83,8 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
         orig = torch.zeros(B, samples_per_view, 3, device=device)
         dirs = torch.zeros(B, samples_per_view, 3, device=device)
         
-        # === FOREGROUND-BIASED SAMPLING ===
-        num_fg = samples_per_view // 2  # 50% of rays MUST hit the robot
+        # Foreground-biased sampling
+        num_fg = samples_per_view // 2  # 50% of rays must hit the robot
         num_bg = samples_per_view - num_fg
         
         u_idx = torch.zeros(B, samples_per_view, device=device, dtype=torch.long)
@@ -105,7 +104,7 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
                 v_idx[b, :num_fg] = chosen_fg[:, 0]
                 u_idx[b, :num_fg] = chosen_fg[:, 1]
             else:
-                # Fallback if the frame is completely empty (rare)
+                # Fallback if the frame is completely empty
                 v_idx[b, :num_fg] = torch.randint(0, H, (num_fg,), device=device)
                 u_idx[b, :num_fg] = torch.randint(0, W, (num_fg,), device=device)
                 
@@ -116,24 +115,24 @@ def sample_orthographic_rays(target_frames, num_samples=1024, image_mode="mask")
         u = (u_idx.float() / (W - 1)) * 2.0 - 1.0
         v_coord = (v_idx.float() / (H - 1)) * 2.0 - 1.0
     
-        # 2. Map coordinates based on strict ANSYS camera positions
+        # Map coordinates based on ANSYS camera axes
         if v == 0: # Side 1 (Camera at +X, looking at -X)
-            orig[..., 0], orig[..., 1], orig[..., 2] = 1.0, u, v_coord
+            orig[..., 0], orig[..., 1], orig[..., 2] = 1.0, u, -v_coord
             dirs[..., 0] = -1.0
         elif v == 1: # Side 2 (Camera at +Y, looking at -Y)
-            orig[..., 0], orig[..., 1], orig[..., 2] = u, 1.0, v_coord
+            orig[..., 0], orig[..., 1], orig[..., 2] = -u, 1.0, -v_coord
             dirs[..., 1] = -1.0
         elif v == 2: # Side 3 (Camera at -X, looking at +X)
-            orig[..., 0], orig[..., 1], orig[..., 2] = -1.0, u, v_coord
+            orig[..., 0], orig[..., 1], orig[..., 2] = -1.0, -u, -v_coord
             dirs[..., 0] = 1.0
         elif v == 3: # Top (Camera at +Z, looking at -Z)
-            orig[..., 0], orig[..., 1], orig[..., 2] = u, v_coord, 1.0
+            orig[..., 0], orig[..., 1], orig[..., 2] = -v_coord, -u, 1.0
             dirs[..., 2] = -1.0
 
         origins_list.append(orig)
         directions_list.append(dirs)
         
-        # 3. Extract the Mask values safely
+        # Extract the Mask values
         view_frames = target_frames[:, v].permute(0, 2, 3, 1)
         batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(B, samples_per_view)
         mask_pixels = view_frames[batch_indices, v_idx, u_idx, :] 
@@ -170,16 +169,16 @@ def get_full_image_rays(H, W, view_idx=0, device='cuda'):
     
     # Map the coordinates matching the training views
     if view_idx == 0:   # Side 1: Camera at +X, looking at -X
-        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = 1.0, u.squeeze(), v_coord.squeeze()
+        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = 1.0, u.squeeze(), -v_coord.squeeze()
         ray_dirs[..., 0] = -1.0
     elif view_idx == 1: # Side 2: Camera at +Y, looking at -Y
-        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = u.squeeze(), 1.0, v_coord.squeeze()
+        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = -u.squeeze(), 1.0, -v_coord.squeeze()
         ray_dirs[..., 1] = -1.0
     elif view_idx == 2: # Side 3: Camera at -X, looking at +X
-        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = -1.0, u.squeeze(), v_coord.squeeze()
+        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = -1.0, -u.squeeze(), -v_coord.squeeze()
         ray_dirs[..., 0] = 1.0
     elif view_idx == 3: # Top: Camera at +Z, looking at -Z
-        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = u.squeeze(), v_coord.squeeze(), 1.0
+        ray_origins[..., 0], ray_origins[..., 1], ray_origins[..., 2] = -v_coord.squeeze(), -u.squeeze(), 1.0
         ray_dirs[..., 2] = -1.0
 
     return ray_origins, ray_dirs
@@ -187,7 +186,7 @@ def get_full_image_rays(H, W, view_idx=0, device='cuda'):
 def render_rays_chunked(ray_marcher, decoder, curr_planes, ray_origins, ray_dirs, chunk_size=4096):
     """
     Memory-safe wrapper for VolumetricRayMarcher.
-    Splits a massive bundle of rays into smaller chunks to prevent VRAM OOM crashes.
+    Splits large bundle of rays into smaller chunks to prevent VRAM OOM crashes.
     """
     B, num_rays, _ = ray_origins.shape
     device = ray_origins.device
@@ -198,7 +197,7 @@ def render_rays_chunked(ray_marcher, decoder, curr_planes, ray_origins, ray_dirs
             origins_chunk = ray_origins[:, i:i+chunk_size, :]
             dirs_chunk = ray_dirs[:, i:i+chunk_size, :]
             
-            # Call your existing render function on just this small block
+            # Call existing render function
             rgb_chunk = ray_marcher.render_rays(decoder, curr_planes, origins_chunk, dirs_chunk)
             all_rgb.append(rgb_chunk)
             
