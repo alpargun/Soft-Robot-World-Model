@@ -25,7 +25,7 @@ def main():
     
     # 1. Configuration
     EXPERIMENT_NAME = "multiView_Triplane_E2E_TV_regularization"
-    MASTER_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis"
+    MASTER_DIR = r"/home/alp/Desktop/SoftRobot_Dataset_Hysteresis"
     
     # Automatically grab all folders inside MASTER_DIR except "old"
     DATA_DIRS = [
@@ -54,7 +54,7 @@ def main():
     SEQUENCE_LENGTH = 24
     FEATURE_DIM = 64
     
-    RAYS_PER_STEP = 1024 # More rays = better quality but slower training.
+    RAYS_PER_STEP = 2560 # More rays = better quality but slower training.
     BURN_IN_LENGTH = 5 # Number of frames to "burn in" the hidden state before autoregression begins
     CURRICULUM_SCHEDULE = [30, 70] # Curriculum learning stages: crawl, walk, run
     VAL_PERCENTAGE = 0.15 # Percentage of pure bending cases to hold out for validation
@@ -242,6 +242,10 @@ def main():
                 # Render the rays using the Triplanes and the NOF
                 pred_pixels = ray_marcher.render_rays(decoder, triplane_next_pred, ray_origins, ray_dirs)
                 
+                # Force all values perfectly into the [0, 1] range to prevent CUDA precision crashes
+                pred_pixels = torch.clamp(pred_pixels, min=1e-5, max=1.0 - 1e-5)
+                target_pixels = torch.clamp(target_pixels, min=0.0, max=1.0)
+                
                 # Calculate 2D pixel losses on the raycasted output
                 raw_bce = bce_loss_fn(pred_pixels, target_pixels)
                 loss_bce = raw_bce.view(B, -1).mean(dim=1) 
@@ -319,8 +323,13 @@ def main():
                     
                     # Compute fast L1 loss on rays to track generalization
                     ray_o, ray_d, target_p = sample_orthographic_rays(
-                        frames_next_true_val, num_samples=RAYS_PER_STEP)
+                        frames_next_true_val, num_samples=RAYS_PER_STEP
+                    )
                     pred_p = ray_marcher.render_rays(decoder, pred_trip, ray_o, ray_d)
+                    
+                    #  CUDA BCELOSS fix
+                    pred_p = torch.clamp(pred_p, min=1e-5, max=1.0 - 1e-5)
+                    target_p = torch.clamp(target_p, min=0.0, max=1.0)
                     
                     # Hybrid BCE+Dice Loss for Validation
                     l_bce = bce_loss_fn(pred_p, target_p).view(B_val, -1).mean(dim=1)
