@@ -46,7 +46,7 @@ def main():
       
     RESUME_CHECKPOINT_PATH = '' # If left empty, training starts from scratch.
     
-    BATCH_SIZE = 2 # or 4 if GPU memory allows
+    BATCH_SIZE = 4 # or 4 if GPU memory allows
     LEARNING_RATE = 1e-4
     NUM_EPOCHS = 1000
 
@@ -54,10 +54,17 @@ def main():
     SEQUENCE_LENGTH = 24
     FEATURE_DIM = 64
     
-    RAYS_PER_STEP = 2560 # More rays = better quality but slower training.
+    # Increased back to 4096 because Activation Checkpointing frees the required VRAM
+    RAYS_PER_STEP = 8192 # More rays = better quality but slower training.
     BURN_IN_LENGTH = 5 # Number of frames to "burn in" the hidden state before autoregression begins
+    TF_UNTIL = 400 # Number of epochs to decay teacher forcing from 1.0 to 0.0
     CURRICULUM_SCHEDULE = [30, 70] # Curriculum learning stages: crawl, walk, run
     VAL_PERCENTAGE = 0.15 # Percentage of pure bending cases to hold out for validation
+
+    # Loss Weights
+    lambda_inverse = 0.5 # Controls penalty for predicting the wrong action history from physical change
+    lambda_plane_sparse = 0.005 # Controls penalty for drawing unnecessary pixels on the latent planes
+    lambda_tv = 0.01 # Controls penalty for high-frequency grid artifacts on the latent planes
 
     # Check for GPU availability
     if torch.cuda.is_available():
@@ -170,6 +177,9 @@ def main():
         
         epoch_loss = 0.0
         
+        # Calculate teacher forcing probability (Decays from 1.0 to 0.0 over the first TF_UNTIL epochs)
+        tf_prob = max(0.0, 1.0 - (epoch / float(TF_UNTIL))) if TF_UNTIL > 0 else 0.0
+        
         # Wraps the dataloader to show a progress bar for the current epoch
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch [{epoch+1}/{NUM_EPOCHS}]")):
             videos = batch["video"].to(device)
@@ -229,8 +239,6 @@ def main():
                     # Predict the sequence of actions and calculate the loss
                     pred_action_seq = dynamics.predict_inverse_action_sequence(current_triplane, triplane_next_pred)
                     loss_inverse = F.mse_loss(pred_action_seq, target_action_seq)
-                
-                lambda_inverse = 2.0 # Strong weight to bind actions to physics
 
                 # End-to-end raycasting loss: Compare the predicted 3D state to the next frame's ground truth
                 frames_next_true = videos[:, t+1] # Shape: [B, Views, C, H, W]
@@ -239,8 +247,8 @@ def main():
                 ray_origins, ray_dirs, target_pixels = sample_orthographic_rays(
                     frames_next_true, num_samples=RAYS_PER_STEP)
                 
-                # Render the rays using the Triplanes and the NOF
-                pred_pixels = ray_marcher.render_rays(decoder, triplane_next_pred, ray_origins, ray_dirs)
+                # Render rays using Activation Checkpointing to drastically lower VRAM usage
+                pred_pixels = torch.utils.checkpoint.checkpoint(ray_marcher.render_rays, decoder, triplane_next_pred, ray_origins, ray_dirs, use_reentrant=False)
                 
                 # Force all values perfectly into the [0, 1] range to prevent CUDA precision crashes
                 pred_pixels = torch.clamp(pred_pixels, min=1e-5, max=1.0 - 1e-5)
@@ -251,13 +259,11 @@ def main():
                 loss_bce = raw_bce.view(B, -1).mean(dim=1) 
                 loss_dice = dice_loss_per_batch(pred_pixels, target_pixels) 
                 
-                # Forces every pixel on the latent planes  to remain 0.0 unless specifically needed to draw the robot
+                # Forces every pixel on the latent planes to remain 0.0 unless specifically needed to draw the robot
                 loss_plane_sparsity = sum([torch.mean(torch.abs(triplane_next_pred[k])) for k in ['xy', 'xz', 'yz']])
-                lambda_plane_sparse = 0.02 # Controls penalty for drawing unnecessary pixels on the latent planes
                 
                 # TV Loss to prevent high-frequency grid artifacts
                 loss_tv = calculate_tv_loss(triplane_next_pred)
-                lambda_tv = 0.05
                 
                 # Final summation
                 step_loss = (loss_bce + loss_dice + (lambda_inverse * loss_inverse) + (lambda_tv * loss_tv) + (lambda_plane_sparse * loss_plane_sparsity)).mean()
@@ -265,8 +271,11 @@ def main():
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
-                # Feed the predicted planes back in for the next step
-                current_triplane = triplane_next_pred
+                # Scheduled Sampling: Decides whether to self-correct using ground truth or run blind
+                if random.random() < tf_prob:
+                    current_triplane = encoder(v_top[:, t+1], v_s1[:, t+1], v_s2[:, t+1], v_s3[:, t+1])
+                else:
+                    current_triplane = triplane_next_pred
 
             # We only average the loss and backpropagate if we predicted more than 0 steps
             if autoregressive_steps > 0:
@@ -281,6 +290,7 @@ def main():
                 
         # Log the inverse loss to tensorboard at the end of the epoch
         writer.add_scalar('Training/Inverse_Action_Loss', loss_inverse.item() if isinstance(loss_inverse, torch.Tensor) else 0.0, epoch + 1)
+        writer.add_scalar('Training/Teacher_Forcing_Prob', tf_prob, epoch + 1)
         
         # Step the learning rate down appropriately per epoch
         scheduler.step()
