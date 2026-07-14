@@ -24,7 +24,7 @@ from src.decoder_nof import NOFDecoder
 def main():
     
     # 1. Configuration
-    EXPERIMENT_NAME = "multiView_Triplane_E2E_TV_regularization"
+    EXPERIMENT_NAME = "multiView_Triplane_JEPA"
     MASTER_DIR = r"/home/alp/Desktop/SoftRobot_Dataset_Hysteresis"
     
     # Automatically grab all folders inside MASTER_DIR except "old"
@@ -62,6 +62,7 @@ def main():
     VAL_PERCENTAGE = 0.15 # Percentage of pure bending cases to hold out for validation
 
     # Loss Weights
+    lambda_latent = 1.0 # Controls JEPA latent consistency to prevent 3D hallucinations
     lambda_inverse = 0.5 # Controls penalty for predicting the wrong action history from physical change
     lambda_plane_sparse = 0.005 # Controls penalty for drawing unnecessary pixels on the latent planes
     lambda_tv = 0.01 # Controls penalty for high-frequency grid artifacts on the latent planes
@@ -227,6 +228,12 @@ def main():
                 # Predict the next 3D state blindly using the dynamics engine
                 triplane_next_pred, hidden_state = dynamics(current_triplane, action_t, hidden_state)
 
+                # JEPA Latent Consistency Loss: Forces the network to predict the next latent state without peeking at the ground truth
+                # Encode target frame. Detach to train Dynamics, not Encoder.
+                triplane_next_true = encoder(v_top[:, t+1], v_s1[:, t+1], v_s2[:, t+1], v_s3[:, t+1])
+                loss_latent = sum([F.mse_loss(triplane_next_pred[k], triplane_next_true[k].detach()) for k in ['xy', 'xz', 'yz']])
+                # ====================================================================
+
                 # Sequence Inverse Dynamics Loss: Forces the network to predict the action history from physical change
                 loss_inverse = 0.0
                 history_len = dynamics.history_len
@@ -266,14 +273,15 @@ def main():
                 loss_tv = calculate_tv_loss(triplane_next_pred)
                 
                 # Final summation
-                step_loss = (loss_bce + loss_dice + (lambda_inverse * loss_inverse) + (lambda_tv * loss_tv) + (lambda_plane_sparse * loss_plane_sparsity)).mean()
+                step_loss = (loss_bce + loss_dice + (lambda_latent * loss_latent) + (lambda_inverse * loss_inverse) + (lambda_tv * loss_tv) + (lambda_plane_sparse * loss_plane_sparsity)).mean()
                 
                 batch_sequence_loss += step_loss
                 autoregressive_steps += 1
                 
                 # Scheduled Sampling: Decides whether to self-correct using ground truth or run blind
                 if random.random() < tf_prob:
-                    current_triplane = encoder(v_top[:, t+1], v_s1[:, t+1], v_s2[:, t+1], v_s3[:, t+1])
+                    # Recycle the true Triplane we just generated for JEPA
+                    current_triplane = triplane_next_true
                 else:
                     current_triplane = triplane_next_pred
 
@@ -288,8 +296,9 @@ def main():
                 
                 epoch_loss += batch_sequence_loss.item()
                 
-        # Log the inverse loss to tensorboard at the end of the epoch
+        # Log the inverse and latent losses to tensorboard at the end of the epoch
         writer.add_scalar('Training/Inverse_Action_Loss', loss_inverse.item() if isinstance(loss_inverse, torch.Tensor) else 0.0, epoch + 1)
+        writer.add_scalar('Training/Latent_Consistency_Loss', loss_latent.item() if isinstance(loss_latent, torch.Tensor) else 0.0, epoch + 1)
         writer.add_scalar('Training/Teacher_Forcing_Prob', tf_prob, epoch + 1)
         
         # Step the learning rate down appropriately per epoch
