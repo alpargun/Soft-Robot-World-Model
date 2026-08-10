@@ -10,7 +10,7 @@ This project implements an action-conditioned world model for a soft robotic man
 
 | Real-Life Hardware | ANSYS Simulation Environment |
 | :---: | :---: |
-| <img src="https://github.com/user-attachments/assets/PLACEHOLDER-IMAGE-1" width="400"> | <img src="https://github.com/user-attachments/assets/PLACEHOLDER-IMAGE-2" width="400"> |
+| <img src="assets/3bellow_real.png" width="200"> | <img src="assets/3bellow_sim.png" width="200"> |
 
 ## Technical Architecture
 
@@ -23,11 +23,20 @@ To achieve stable, long-horizon physics predictions without collapsing, the mode
 
 Below are samples of the 2D world model successfully predicting the physical bending dynamics of the soft robot over time. 
 
-| Validation Set | Validation Set | Custom Action Sequence (Pure Generation) |
+### Validation Set (Unseen Ground Truth Comparison)
+
+| &nbsp; | &nbsp; |
+| :---: | :---: |
+| **Validation Case 1**<br><video src="https://github.com/user-attachments/assets/c1271794-bbf2-4f06-86bd-ed9205048f92" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 1* | **Validation Case 2**<br><video src="https://github.com/user-attachments/assets/37669af7-841a-41a1-9778-121285f71a94" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 2* |
+| **Validation Case 3**<br><video src="https://github.com/user-attachments/assets/f29866b0-1955-4b43-979b-a13ecaa47461" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 3* | **Validation Case 4**<br><video src="https://github.com/user-attachments/assets/b5e3e15c-48aa-4f7c-aed2-a6b9f53a9ee5" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 4* |
+| **Validation Case 5**<br><video src="https://github.com/user-attachments/assets/ce0c52d2-1f60-4804-b397-1b367bfbef7b" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 5* | **Validation Case 6**<br><video src="https://github.com/user-attachments/assets/c776879d-8a44-4862-a397-9331a11b3949" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 6* |
+
+### Custom Action Sequences (Pure Generation)
+*These sequences have no ground truth reference. The model is hallucinating the physics purely based on the input pressure actions.*
+
+| &nbsp; | &nbsp; | &nbsp; |
 | :---: | :---: | :---: |
-| <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-1" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 1* | <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-2" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 2* | <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-3" autoplay loop muted playsinline width="100%"></video><br>*No Ground Truth Reference* |
-| <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-4" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 3* | <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-5" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 4* | <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-6" autoplay loop muted playsinline width="100%"></video><br>*No Ground Truth Reference* |
-| <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-7" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 5* | <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-8" autoplay loop muted playsinline width="100%"></video><br>*Unseen Validation Target 6* | <video src="https://github.com/user-attachments/assets/PLACEHOLDER-ID-9" autoplay loop muted playsinline width="100%"></video><br>*No Ground Truth Reference* |
+| **Custom Sim 1**<br><video src="https://github.com/user-attachments/assets/a3e3e04d-79a6-4ebc-8050-7c9a23e1c209" autoplay loop muted playsinline width="100%"></video><br>*No Ground Truth Reference* | **Custom Sim 2**<br><video src="https://github.com/user-attachments/assets/ea8fab15-a49e-4677-8e87-88f186a31ec9" autoplay loop muted playsinline width="100%"></video><br>*No Ground Truth Reference* | **Custom Sim 3**<br><video src="https://github.com/user-attachments/assets/7f22e276-d2da-4df8-a454-059eb4303f72" autoplay loop muted playsinline width="100%"></video><br>*No Ground Truth Reference* |
 
 ## Notes
 
