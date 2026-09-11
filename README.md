@@ -5,7 +5,7 @@ This project implements an action-conditioned world model for a soft robotic man
 ## Project Overview
 
 * **The Robot:** A custom soft robotic manipulator built from 3 inflatable bellows arranged in a triangle, so that the 3 pressure inputs bend it like a continuum robot.
-* **The Dataset:** Video data collected from ANSYS finite-element simulations. Each simulation is rendered from 4 calibrated viewpoints (3 side views 90 degrees apart and 1 top view). Pressure profiles span 0 to 100,000 Pa in 25,000 Pa steps and include ramp-up / pause / ramp-down sequences, staircases and random walks, which expose the nonlinear hysteresis of the pneumatic actuator.
+* **The Dataset:** Video data collected from ANSYS finite-element simulations. Each simulation is rendered from 4 calibrated viewpoints (3 side views 90 degrees apart and 1 top view). Pressure profiles span 1 Pa to 100,000 Pa in 25,000 Pa steps and include ramp-up / pause / ramp-down sequences, staircases and random walks, which expose the nonlinear hysteresis of the pneumatic actuator.
 * **The World Model:** A 2D neural simulator that autoregressively predicts the deformation of the soft robot conditioned on the 3D pressure action.
 
 | Real-Life Hardware | ANSYS Simulation Environment |
@@ -17,7 +17,7 @@ This project implements an action-conditioned world model for a soft robotic man
 * **Encoder / Decoder:** A lightweight convolutional encoder maps each 128x128 silhouette to a 32x32 spatial latent. A decoder with residual blocks maps the predicted latent back to a mask.
 * **Autoregressive Dynamics:** A Convolutional GRU (ConvGRU) evolves the spatial latent over time. The 3D pressure action is embedded by an MLP, broadcast spatially and fed into the GRU together with the current latent. Dropout on the hidden state pushes the model to rely on the action rather than on memory alone.
 * **Inverse-Dynamics Head:** An auxiliary head predicts the last 5 actions from the current and next latent. This forces the latent to encode the recent pressure history, which is what makes the hysteresis learnable from a single frame.
-* **Training Scheme:** Each sequence starts with a short teacher-forced burn-in (5 frames), or a cold start from a single frame 30% of the time, followed by strict autoregression where every predicted latent is fed back into the model. The prediction horizon grows through the run (4, then 11, then 19 steps ahead) so the model learns short-term dynamics before long rollouts. Training windows are 24 frames at a temporal stride of 2.
+* **Training Scheme:** Each sequence starts with a short teacher-forced burn-in (5 frames), or a cold start from a single frame 30% of the time, followed by strict autoregression where every predicted latent is fed back into the model. The prediction horizon grows through the run (4, then 11, then 19 steps ahead) so the model learns short-term dynamics before long rollouts. Training windows are 24 frames (1.6 s) at a temporal stride of 2 from the 30 fps renderings.
 * **Multi-Objective Loss:** BCE + Dice for sharp mask boundaries, plus an MSE inverse-action loss. Gradient clipping and a cosine learning-rate schedule keep training stable.
 
 The whole model has roughly 0.5M parameters.
@@ -28,7 +28,7 @@ Below are samples of the 2D world model predicting the bending dynamics of the s
 
 ### Inference Speed
 
-A full 10-second deformation sequence takes 10 to 50 minutes of ANSYS simulation depending on the pressure input and on self-contact under extreme bending. The world model rolls out the same sequence in about 0.1 seconds on an Apple M4 Max (over 1000 predicted frames per second), a speedup of roughly four orders of magnitude.
+An 8-second deformation sequence takes 10 to 60 minutes of ANSYS simulation depending on the pressure input and on self-contact under extreme bending, and the 30-60 second random-walk sequences take many hours. The world model rolls out the 8-second sequence in about 0.1 seconds and a 30-second sequence in about 0.35 seconds on a consumer laptop (over 1000 predicted frames per second), a speedup of roughly four orders of magnitude.
 
 ### Validation Set (Unseen Ground Truth Comparison)
 
