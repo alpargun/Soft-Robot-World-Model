@@ -1,8 +1,10 @@
 import os
 import random
-import torch
-import numpy as np
+import time
+
 import cv2
+import numpy as np
+import torch
 from torch.utils.data import Subset
 
 # Import custom modules
@@ -68,7 +70,7 @@ def render_side_by_side_video(frames_gt, frames_pred, pressures, burn_in_len, ou
 def main():
     CHECKPOINT_PATH = "runs/singleView12_MASK_2026-05-24_13-30-07/best_model.pth" 
     MASTER_DIR = r"/Users/alp/SoftRobot_Dataset_Hysteresis"
-    OUTPUT_DIR = "validation_videos"
+    OUTPUT_DIR = "validation_videos-new"
     
     FEATURE_DIM = 64
     BURN_IN_LENGTH = 5
@@ -123,6 +125,8 @@ def main():
         with torch.no_grad():
             curr_feat = encoder(video_seq[start_t:start_t+1])
             h_val = None
+
+            t0 = time.perf_counter()
             
             # PHASE 1: Burn-In
             for t in range(start_t, start_t + BURN_IN_LENGTH - 1):
@@ -145,7 +149,12 @@ def main():
                 used_pressures.append(action.squeeze().cpu().numpy())
                 
                 curr_feat = pred_feat
-                
+
+            if device.type == "mps": torch.mps.synchronize()
+            elif device.type == "cuda": torch.cuda.synchronize()
+            elapsed = time.perf_counter() - t0
+            print(f"  rollout: {end_t - start_t} frames in {elapsed:.3f} s ({(end_t - start_t) / elapsed:.1f} fps)")
+        
         return gt_frames, pred_frames, used_pressures
 
     # Process validation cases
