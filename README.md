@@ -5,7 +5,7 @@ This project implements an action-conditioned world model for a soft robotic man
 ## Project Overview
 
 * **The Robot:** A custom soft robotic manipulator built from 3 inflatable bellows arranged in a triangle, so that the 3 pressure inputs bend it like a continuum robot.
-* **The Dataset:** Video data collected from ANSYS finite-element simulations. Each simulation is rendered from 4 calibrated viewpoints (3 side views 90 degrees apart and 1 top view). Pressure profiles span 1 Pa to 100,000 Pa in 25,000 Pa steps and include ramp-up / pause / ramp-down sequences, staircases and random walks, which expose the nonlinear hysteresis of the pneumatic actuator.
+* **The Dataset:** Video data collected from ANSYS finite-element simulations. Each simulation is rendered from 4 calibrated viewpoints (3 side views 90 degrees apart and 1 top view). Pressure profiles span 1 Pa to 100,000 Pa in 25,000 Pa steps and include ramp-up / pause / ramp-down sequences, staircases and random walks, which expose the nonlinear hysteresis of the pneumatic actuator. The staircase and random-walk profiles were added for persistence of excitation: a single ramp concentrates its energy at one low frequency, while steps and random walks spread it across the band so the model sees the actuator's full dynamic range.
 * **The World Model:** A 2D neural simulator that autoregressively predicts the deformation of the soft robot conditioned on the 3D pressure action.
 
 | Real-Life Hardware | ANSYS Simulation Environment |
