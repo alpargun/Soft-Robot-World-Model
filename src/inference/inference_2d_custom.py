@@ -114,7 +114,7 @@ def generate_10_publishable_scenarios(time_steps, device):
     # --- 10. Smooth Random Walk ---
     # Mirrors the 15 dataset random cases for direct comparison
     p10 = torch.zeros((1, time_steps, 3), dtype=torch.float32).to(device)
-    keyframes = np.random.rand(4, 3) 
+    keyframes = np.random.default_rng(0).random((4, 3)) 
     keyframes[0] = [0.0, 0.0, 0.0]
     keyframes[3] = [0.0, 0.0, 0.0]
     
@@ -182,7 +182,7 @@ def main():
     DATA_DIRS = [os.path.join(DATA_DIR, d) for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d)) and d != "old"]
     DATA_DIRS.sort() # Sorting ensures Case_1 is grabbed, giving us a true 0.0 Pa starting frame
     
-    dataset = SoftRobotDataset(run_folders=DATA_DIRS, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=2, frame_stride=2)
+    dataset = SoftRobotDataset(run_folders=DATA_DIRS, img_size=(128, 128), crop_size=600, image_mode="mask", seq_len=None, frame_stride=2)
     
     sample = dataset[0]
     first_frame = sample["video"][0:1, 0].to(device) 
