@@ -1,15 +1,17 @@
+# Toy comparison of input spectra: a single ramp vs. a random step signal.
+# Motivates the staircase and random-walk profiles added to the dataset for
+# persistence of excitation. Not an analysis of the recorded dataset.
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.fft import fft, fftfreq
 
 def generate_signals(time_steps=60, max_p=100.0, min_p=1.0):
-    # 1. The Ramp Signal (What you currently have)
+    # 1. Ramp signal (ramp up / ramp down profile used in the base dataset)
     ramp_up = np.linspace(min_p, max_p, time_steps // 2)
     ramp_down = np.linspace(max_p, min_p, time_steps // 2)
     ramp_signal = np.concatenate([ramp_up, ramp_down])
     
-    # 2. The PRBS/Random Step Signal (What your advisor wants)
-    # Randomly jump to different pressure levels every 10 frames
+    # 2. Random step signal: new pressure level every 10 frames
     random_signal = np.ones(time_steps) * min_p
     for i in range(0, time_steps, 10):
         random_signal[i:i+10] = np.random.uniform(min_p, max_p)
@@ -18,7 +20,7 @@ def generate_signals(time_steps=60, max_p=100.0, min_p=1.0):
 
 def plot_fft_comparison():
     time_steps = 60
-    fps = 30 # Assuming your 60 frames represent 2 seconds of real time
+    fps = 30 # 60 frames = 2 seconds of simulation
     T = 1.0 / fps
     
     ramp_signal, random_signal = generate_signals(time_steps)
@@ -41,7 +43,6 @@ def plot_fft_comparison():
     axs[0, 0].set_ylabel('Pressure (kPa)')
     axs[0, 0].set_xlabel('Frame')
     
-    # THE FIX IS HERE
     axs[0, 1].plot(random_signal, color='red', linewidth=2, drawstyle='steps-post')
     axs[0, 1].set_title('Time Domain: Persistent Excitation (Random Steps)')
     axs[0, 1].set_xlabel('Frame')
